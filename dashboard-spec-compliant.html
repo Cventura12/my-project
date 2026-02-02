@@ -1,0 +1,385 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Obligo Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+            background: #f9fafb;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+
+        header {
+            background: #1a1f2e;
+            border-radius: 8px;
+            padding: 20px 24px;
+            margin-bottom: 20px;
+        }
+
+        .logo {
+            font-size: 32px;
+            font-weight: 700;
+            margin-bottom: 4px;
+        }
+
+        .logo-o {
+            color: #00d26a;
+        }
+
+        .logo-text {
+            color: white;
+        }
+
+        .subtitle {
+            color: #9ca3af;
+            font-size: 14px;
+        }
+
+        .obligations-list {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        /* ObligationCard Styles - Matches Day 1 Option 2 Spec */
+        .obligation-card {
+            background: white;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+            transition: box-shadow 0.2s;
+        }
+
+        .obligation-card:hover {
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+
+        /* A. HEADER */
+        .card-header {
+            padding: 16px;
+            border-bottom: 1px solid #f3f4f6;
+            display: flex;
+            align-items: start;
+            justify-content: space-between;
+            gap: 12px;
+        }
+
+        .card-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: #111827;
+            line-height: 1.4;
+            margin-bottom: 4px;
+        }
+
+        .card-subtext {
+            font-size: 14px;
+            color: #6b7280;
+        }
+
+        .provider-icon {
+            flex-shrink: 0;
+            margin-top: 2px;
+        }
+
+        /* B. META ROW */
+        .card-meta {
+            padding: 12px 16px;
+            background: #f9fafb;
+            border-bottom: 1px solid #f3f4f6;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .due-date {
+            font-size: 14px;
+            color: #374151;
+        }
+
+        .confidence-badge {
+            font-size: 12px;
+            padding: 4px 10px;
+            border-radius: 6px;
+            border: 1px solid;
+        }
+
+        .confidence-high {
+            background: #f0fdf4;
+            color: #15803d;
+            border-color: #bbf7d0;
+        }
+
+        .confidence-medium {
+            background: #fefce8;
+            color: #ca8a04;
+            border-color: #fef08a;
+        }
+
+        .confidence-low {
+            background: #f9fafb;
+            color: #6b7280;
+            border-color: #e5e7eb;
+        }
+
+        /* C. PRIMARY ACTION */
+        .card-action {
+            padding: 16px;
+            border-bottom: 1px solid #f3f4f6;
+        }
+
+        .btn-open {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background: #111827;
+            color: white;
+            font-size: 14px;
+            font-weight: 500;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .btn-open:hover {
+            background: #1f2937;
+        }
+
+        .btn-open:disabled {
+            background: #d1d5db;
+            cursor: not-allowed;
+        }
+
+        /* D. ACTION PATH */
+        .card-path {
+            padding: 16px;
+        }
+
+        .btn-path-toggle {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            font-weight: 500;
+            color: #374151;
+            background: none;
+            border: none;
+            cursor: pointer;
+            transition: color 0.2s;
+        }
+
+        .btn-path-toggle:hover {
+            color: #111827;
+        }
+
+        .path-content {
+            margin-top: 12px;
+            padding-top: 12px;
+            border-top: 1px solid #e5e7eb;
+            display: none;
+        }
+
+        .path-content.show {
+            display: block;
+        }
+
+        .path-steps {
+            list-style: none;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .path-step {
+            display: flex;
+            gap: 12px;
+        }
+
+        .step-number {
+            flex-shrink: 0;
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            background: #f3f4f6;
+            color: #374151;
+            font-size: 12px;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            justify-center;
+            border: 1px solid #d1d5db;
+        }
+
+        .step-text {
+            font-size: 14px;
+            color: #374151;
+            line-height: 1.6;
+            padding-top: 2px;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #6b7280;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo"><span class="logo-o">O</span><span class="logo-text">bligo</span></div>
+            <p class="subtitle">Your obligations at a glance</p>
+        </header>
+
+        <div id="loading" class="loading">Loading obligations...</div>
+        <div class="obligations-list" id="obligations-list"></div>
+    </div>
+
+    <script>
+        const API_URL = 'http://localhost:8000';
+
+        // Provider icons
+        const gmailIcon = '<svg class="provider-icon" width="16" height="16" viewBox="0 0 24 24" fill="#ef4444"><path d="M24 5.457v13.909c0 .904-.732 1.636-1.636 1.636h-3.819V11.73L12 16.64l-6.545-4.91v9.273H1.636A1.636 1.636 0 0 1 0 19.366V5.457c0-2.023 2.309-3.178 3.927-1.964L5.455 4.64 12 9.548l6.545-4.91 1.528-1.145C21.69 2.28 24 3.434 24 5.457z"/></svg>';
+
+        const outlookIcon = '<svg class="provider-icon" width="16" height="16" viewBox="0 0 24 24" fill="#3b82f6"><path d="M7.88 12.04q0 .45-.11.87-.1.41-.33.74-.22.33-.58.52-.37.2-.87.2t-.85-.2q-.35-.21-.57-.55-.22-.33-.33-.75-.1-.42-.1-.86t.1-.87q.1-.43.34-.76.22-.34.59-.54.36-.2.87-.20t.86.2q.35.21.57.55.22.34.31.77.1.43.1.88zM24 12v9.38q0 .46-.33.8-.33.32-.8.32H7.13q-.46 0-.8-.33-.32-.33-.32-.8V18H1q-.41 0-.7-.3-.3-.29-.3-.7V7q0-.41.3-.7Q.58 6 1 6h6.5V2.55q0-.44.3-.75.3-.3.75-.3h12.9q.44 0 .75.3.3.3.3.75V10.85l1.24.72h.01q.1.07.18.18.07.12.07.25zm-6-8.25v3h3v-3zm0 4.5v3h3v-3zm0 4.5v1.83l3.05-1.83zm-5.25-9v3h3.75v-3zm0 4.5v3h3.75v-3zm0 4.5v2.03l2.41 1.5 1.34-.8v-2.73zM9 3.75V6h2l.13.01.12.04v-2.3zM5.98 15.98q.9 0 1.6-.3.7-.32 1.19-.86.48-.55.73-1.28.25-.74.25-1.61 0-.83-.25-1.55-.24-.71-.71-1.24t-1.15-.83q-.68-.3-1.55-.3-.92 0-1.64.3-.71.3-1.2.85-.5.54-.75 1.3-.25.74-.25 1.63 0 .85.26 1.56.26.72.74 1.23.48.52 1.17.81.69.3 1.56.3zM7.5 21h12.39L12 16.08V17q0 .41-.3.7-.29.3-.7.3H7.5zm15-.13v-7.24l-5.9 3.54Z"/></svg>';
+
+        // Fetch and render obligations
+        async function loadObligations() {
+            try {
+                const response = await fetch(`${API_URL}/daily_digest/`);
+                const data = await response.json();
+
+                document.getElementById('loading').style.display = 'none';
+
+                if (data.top_obligations && data.top_obligations.length > 0) {
+                    renderObligations(data.top_obligations);
+                }
+            } catch (error) {
+                document.getElementById('loading').textContent = 'Failed to load obligations';
+            }
+        }
+
+        function renderObligations(obligations) {
+            const container = document.getElementById('obligations-list');
+            container.innerHTML = obligations.map(obl => createObligationCard(obl)).join('');
+
+            // Add click handlers for action path toggles
+            obligations.forEach((obl, index) => {
+                if (obl.actionPath && obl.actionPath.length > 0) {
+                    const btn = document.getElementById(`path-toggle-${index}`);
+                    const content = document.getElementById(`path-content-${index}`);
+                    if (btn && content) {
+                        btn.addEventListener('click', () => {
+                            content.classList.toggle('show');
+                        });
+                    }
+                }
+
+                // Add click handler for Open button
+                const openBtn = document.getElementById(`open-btn-${index}`);
+                if (openBtn && obl.sourceLink) {
+                    openBtn.addEventListener('click', () => {
+                        window.open(obl.sourceLink, '_blank');
+                    });
+                }
+            });
+        }
+
+        function createObligationCard(obl, index) {
+            // Determine source from email_source or default to gmail
+            const source = obl.email_source || 'gmail';
+            const providerIcon = source === 'outlook' ? outlookIcon : gmailIcon;
+
+            // Map total_score to confidence
+            let confidence = 'medium';
+            if (obl.total_score >= 40) confidence = 'high';
+            else if (obl.total_score < 30) confidence = 'low';
+
+            const confidenceText = {
+                'high': 'High confidence',
+                'medium': 'Medium confidence',
+                'low': 'Low confidence'
+            };
+
+            const confidenceClass = `confidence-${confidence}`;
+
+            return `
+                <div class="obligation-card">
+                    <!-- A. HEADER -->
+                    <div class="card-header">
+                        <div style="flex: 1; min-width: 0;">
+                            <div class="card-title">${obl.summary}</div>
+                            <div class="card-subtext">
+                                ${obl.sender || obl.authority || 'Unknown sender'} · ${source === 'gmail' ? 'Gmail' : 'Outlook'}
+                            </div>
+                        </div>
+                        ${providerIcon}
+                    </div>
+
+                    <!-- B. META ROW -->
+                    <div class="card-meta">
+                        <span class="due-date">📅 ${obl.deadline || 'No due date detected'}</span>
+                        <span class="confidence-badge ${confidenceClass}">
+                            ${confidenceText[confidence]}
+                        </span>
+                    </div>
+
+                    <!-- C. PRIMARY ACTION -->
+                    <div class="card-action">
+                        <button id="open-btn-${index}" class="btn-open" ${!obl.sourceLink ? 'disabled' : ''}>
+                            <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/>
+                            </svg>
+                            Open
+                        </button>
+                    </div>
+
+                    <!-- D. ACTION PATH -->
+                    ${obl.actionPath && obl.actionPath.length > 0 ? `
+                        <div class="card-path">
+                            <button id="path-toggle-${index}" class="btn-path-toggle">
+                                <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                    <circle cx="12" cy="12" r="10" stroke-width="2"></circle>
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 16v-4m0-4h.01"></path>
+                                </svg>
+                                What do I do first?
+                            </button>
+                            <div id="path-content-${index}" class="path-content">
+                                <ol class="path-steps">
+                                    ${obl.actionPath.map((step, i) => `
+                                        <li class="path-step">
+                                            <span class="step-number">${i + 1}</span>
+                                            <span class="step-text">${step}</span>
+                                        </li>
+                                    `).join('')}
+                                </ol>
+                            </div>
+                        </div>
+                    ` : ''}
+                </div>
+            `;
+        }
+
+        // Load obligations on page load
+        loadObligations();
+    </script>
+</body>
+</html>

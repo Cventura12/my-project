@@ -1,0 +1,3114 @@
+# pip install google-auth-oauthlib google-auth-httplib2 google-api-python-client fastapi uvicorn anthropic python-dotenv APScheduler msal requests
+
+import os
+import json
+import base64
+import uuid
+import hmac
+import hashlib
+import time
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, Field
+from anthropic import Anthropic
+from dotenv import load_dotenv
+import uvicorn
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import re
+import threading
+import logging
+from pathlib import Path
+import msal
+import requests
+
+# ==================== CONFIGURATION ====================
+
+load_dotenv()
+
+# Configure logging. In production we prefer stdout; file logging can be enabled for local dev.
+_log_handlers = [logging.StreamHandler()]
+if os.getenv("LOG_TO_FILE", "").lower() in {"1", "true", "yes"}:
+    _log_handlers.append(logging.FileHandler("obligo.log"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=_log_handlers,
+)
+logger = logging.getLogger('obligo')
+
+app = FastAPI(title="Obligo API", version="1.0.0")
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Gmail scopes: read emails for analysis + send drafts after user approval.
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
+scheduler = BackgroundScheduler()
+
+# Outlook/Microsoft Graph configuration
+OUTLOOK_SCOPES = ['Mail.Read', 'User.Read', 'offline_access']
+OUTLOOK_AUTHORITY = 'https://login.microsoftonline.com/common'
+OUTLOOK_GRAPH_ENDPOINT = 'https://graph.microsoft.com/v1.0'
+
+# ==================== PYDANTIC MODELS ====================
+
+class EmailRequest(BaseModel):
+    email_text: str
+
+class ObligationResponse(BaseModel):
+    requires_action: bool
+    summary: Optional[str] = "TBD"
+    action: Optional[str] = "TBD"
+    deadline: Optional[str] = "TBD"
+    deadline_implied: Optional[bool] = False
+    stakes: Optional[str] = "TBD"
+    authority: Optional[str] = "TBD"
+    blocking: Optional[bool] = False
+
+class MicroActionRequest(BaseModel):
+    obligation_id: str
+    approval_status: str
+    user_notes: Optional[str] = ""
+
+class ActionStep(BaseModel):
+    step_id: int
+    description: str
+    url: Optional[str] = None
+    estimated_minutes: int = 5
+    completed: bool = False
+
+class ActionPlan(BaseModel):
+    obligation_id: str
+    title: str
+    steps: List[ActionStep]
+    total_estimated_minutes: int
+
+# In-memory storage for action plans (replace with Supabase later)
+action_plans_db: Dict[str, ActionPlan] = {}
+execution_progress_db: Dict[str, Dict[int, bool]] = {}
+
+class ActionLogEntry(BaseModel):
+    timestamp: str
+    user_id: str = "default_user"
+    obligation_id: str
+    action: str
+    approval_status: str
+    score: float
+    notes: Optional[str] = ""
+
+# ==================== HELPER FUNCTIONS ====================
+
+def safe_print(text: str):
+    """Safely print Unicode strings on Windows"""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(text.encode('ascii', 'ignore').decode('ascii'))
+
+def normalize_value(value: Any, default: str = "TBD") -> str:
+    """Normalize values to handle None, null, empty strings"""
+    if value is None or value == "null" or value == "" or str(value).strip() == "":
+        return default
+    return str(value).strip()
+
+def normalize_deadline(deadline: Any) -> str:
+    """
+    Normalize deadline to YYYY-MM-DD format or 'TBD'
+    Handles: None, "null", invalid dates, relative dates
+    """
+    if not deadline or deadline == "null":
+        return "TBD"
+
+    deadline_str = str(deadline).strip().lower()
+
+    # Handle common relative dates
+    today = datetime.now()
+    if "today" in deadline_str:
+        return today.strftime("%Y-%m-%d")
+    if "tomorrow" in deadline_str:
+        return (today + timedelta(days=1)).strftime("%Y-%m-%d")
+    if "next week" in deadline_str:
+        return (today + timedelta(days=7)).strftime("%Y-%m-%d")
+
+    # Try to parse as date
+    try:
+        # Try ISO format first
+        date_obj = datetime.fromisoformat(deadline_str)
+        return date_obj.strftime("%Y-%m-%d")
+    except:
+        pass
+
+    # Try common date formats
+    for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y", "%B %d, %Y", "%b %d, %Y"]:
+        try:
+            date_obj = datetime.strptime(deadline_str, fmt)
+            return date_obj.strftime("%Y-%m-%d")
+        except:
+            continue
+
+    # If all parsing fails, return TBD
+    return "TBD"
+
+def log_action(obligation_id: str, action: str, approval_status: str, score: float, notes: str = ""):
+    """
+    Log action to JSON file (Supabase integration ready)
+    TODO: Replace with Supabase insert when ready
+    """
+    entry = ActionLogEntry(
+        timestamp=datetime.now().isoformat(),
+        user_id="default_user",
+        obligation_id=obligation_id,
+        action=action,
+        approval_status=approval_status,
+        score=score,
+        notes=notes
+    )
+
+    # Read existing logs
+    log_file = Path("action_log.json")
+    logs = []
+    if log_file.exists():
+        try:
+            with open(log_file, 'r') as f:
+                logs = json.load(f)
+        except json.JSONDecodeError:
+            logger.warning("action_log.json is corrupted, creating new log")
+            logs = []
+
+    # Append new entry
+    logs.append(entry.dict())
+
+    # Write back
+    with open(log_file, 'w') as f:
+        json.dump(logs, f, indent=2)
+
+    logger.info(f"Action logged: {obligation_id} - {approval_status}")
+
+    # TODO: Insert into Supabase
+    # supabase.table('action_logs').insert(entry.dict()).execute()
+
+def get_demo_obligations() -> List[Dict]:
+    """Return demo obligations for testing/fallback"""
+    return [
+        {
+            "obligation_id": "demo_1",
+            "summary": "Complete project proposal for client meeting",
+            "action": "Finalize and send the project proposal document",
+            "deadline": (datetime.now() + timedelta(days=2)).strftime("%Y-%m-%d"),
+            "stakes": "Completing this on time keeps the project on track",
+            "authority": "Client - ABC Corp",
+            "blocking": True,
+            "total_score": 45.5,
+            "deadline_score": 10,
+            "micro_action": "Open the draft and add final pricing details",
+            "motivation": "This stands out because the client is expecting it soon.",
+            "action_type": "email_draft",
+            "prepared_content": "Hi Team,\n\nPlease find attached our project proposal...",
+            "requires_approval": True,
+            "safety_flags": [],
+            "type": "application",
+            "actionPath": [
+                "Open the application portal or email",
+                "Review required documents",
+                "Prepare missing items"
+            ],
+            "sourceLink": "https://mail.google.com/mail/u/0/#inbox"
+        },
+        {
+            "obligation_id": "demo_2",
+            "summary": "Respond to professor about assignment extension",
+            "action": "Email professor requesting deadline extension",
+            "deadline": (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d"),
+            "stakes": "This relates to your course grade",
+            "authority": "Prof. Smith",
+            "blocking": False,
+            "total_score": 38.2,
+            "deadline_score": 12,
+            "micro_action": "Draft a brief, professional extension request email",
+            "motivation": "A short email could help — worth considering today.",
+            "action_type": "email_draft",
+            "prepared_content": "Dear Professor Smith,\n\nI hope this email finds you well...",
+            "requires_approval": True,
+            "safety_flags": [],
+            "type": "response",
+            "actionPath": [
+                "Open the email",
+                "Draft a short reply",
+                "Send confirmation or answer"
+            ],
+            "sourceLink": "https://mail.google.com/mail/u/0/#inbox"
+        },
+        {
+            "obligation_id": "demo_3",
+            "summary": "Review teammate's pull request",
+            "action": "Review and provide feedback on PR #42",
+            "deadline": (datetime.now() + timedelta(days=3)).strftime("%Y-%m-%d"),
+            "stakes": "Your teammate is waiting on this review",
+            "authority": "Team Lead",
+            "blocking": True,
+            "total_score": 35.8,
+            "deadline_score": 6,
+            "micro_action": "Open GitHub and review the code changes",
+            "motivation": "This is blocking someone else — could be worth doing soon.",
+            "action_type": "checklist",
+            "prepared_content": "1. Review code changes\n2. Test locally\n3. Leave feedback",
+            "requires_approval": False,
+            "safety_flags": [],
+            "type": "assignment",
+            "actionPath": [
+                "Open the assignment instructions",
+                "Review requirements or rubric",
+                "Start or upload the work"
+            ],
+            "sourceLink": "https://github.com/team/repo/pull/42"
+        }
+    ]
+
+# ==================== GMAIL FUNCTIONS ====================
+
+def get_gmail_service():
+    """Get Gmail API service with OAuth"""
+    creds = None
+    if os.path.exists('token.json'):
+        creds = Credentials.from_authorized_user_file('token.json', SCOPES)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open('token.json', 'w') as token:
+            token.write(creds.to_json())
+    return build('gmail', 'v1', credentials=creds)
+
+def extract_email_body(payload):
+    """Extract email body from Gmail API payload"""
+    if 'parts' in payload:
+        for part in payload['parts']:
+            if part['mimeType'] == 'text/plain':
+                if 'data' in part['body']:
+                    return base64.urlsafe_b64decode(part['body']['data']).decode('utf-8')
+            elif part['mimeType'] == 'multipart/alternative':
+                return extract_email_body(part)
+    elif 'body' in payload and 'data' in payload['body']:
+        return base64.urlsafe_b64decode(payload['body']['data']).decode('utf-8')
+    return ""
+
+def get_header(headers, name):
+    """Extract header value from Gmail headers"""
+    for header in headers:
+        if header['name'].lower() == name.lower():
+            return header['value']
+    return ""
+
+def fetch_gmail_emails(max_results=50):
+    """Fetch recent emails from Gmail"""
+    try:
+        service = get_gmail_service()
+        results = service.users().messages().list(userId='me', maxResults=max_results).execute()
+        messages = results.get('messages', [])
+
+        emails = []
+        for msg in messages:
+            msg_data = service.users().messages().get(userId='me', id=msg['id']).execute()
+            headers = msg_data['payload']['headers']
+
+            emails.append({
+                'id': msg['id'],
+                'subject': get_header(headers, 'Subject'),
+                'sender': get_header(headers, 'From'),
+                'date': get_header(headers, 'Date'),
+                'full_text': extract_email_body(msg_data['payload']),
+                'sourceLink': f"https://mail.google.com/mail/u/0/#inbox/{msg['id']}"
+            })
+
+        logger.info(f"Fetched {len(emails)} emails from Gmail")
+        return emails
+    except Exception as e:
+        logger.error(f"Error fetching Gmail emails: {str(e)}")
+        raise
+
+# ==================== GMAIL OAUTH FUNCTIONS ====================
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
+
+
+def _b64url_decode(data: str) -> bytes:
+    padded = data + "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(padded.encode("utf-8"))
+
+
+def _sign_oauth_state(payload: Dict[str, Any]) -> str:
+    """Sign state payload so user_id can't be tampered with in the OAuth roundtrip."""
+    secret = os.getenv("OAUTH_STATE_SECRET")
+    if not secret:
+        raise ValueError("OAUTH_STATE_SECRET not set")
+    body = _b64url_encode(json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+    sig = hmac.new(secret.encode("utf-8"), body.encode("utf-8"), hashlib.sha256).digest()
+    return f"{body}.{_b64url_encode(sig)}"
+
+
+def _verify_oauth_state(state: str, max_age_seconds: int = 10 * 60) -> Dict[str, Any]:
+    secret = os.getenv("OAUTH_STATE_SECRET")
+    if not secret:
+        raise ValueError("OAUTH_STATE_SECRET not set")
+
+    try:
+        body_b64, sig_b64 = state.split(".", 1)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid OAuth state")
+
+    expected_sig = hmac.new(secret.encode("utf-8"), body_b64.encode("utf-8"), hashlib.sha256).digest()
+    expected_sig_b64 = _b64url_encode(expected_sig)
+    if not hmac.compare_digest(expected_sig_b64, sig_b64):
+        raise HTTPException(status_code=400, detail="Invalid OAuth state signature")
+
+    payload = json.loads(_b64url_decode(body_b64).decode("utf-8"))
+    ts = payload.get("ts")
+    if isinstance(ts, (int, float)) and (time.time() - ts) > max_age_seconds:
+        raise HTTPException(status_code=400, detail="OAuth state expired")
+
+    return payload
+
+
+def get_gmail_auth_url(state: Optional[str] = None) -> str:
+    """Generate Gmail OAuth authorization URL for web flow."""
+    import urllib.parse
+    from backend.google_oauth import load_gmail_oauth_credentials, get_gmail_redirect_uri
+
+    client_id, _client_secret = load_gmail_oauth_credentials()
+    redirect_uri = get_gmail_redirect_uri()
+
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(SCOPES),
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "true",
+    }
+    if state:
+        params["state"] = state
+
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
+    logger.info("Generated Gmail OAuth URL")
+    return auth_url
+
+def exchange_gmail_code_for_tokens(auth_code: str) -> Dict[str, Any]:
+    """Exchange Gmail authorization code for tokens."""
+    from backend.google_oauth import load_gmail_oauth_credentials, get_gmail_redirect_uri
+
+    client_id, client_secret = load_gmail_oauth_credentials()
+    redirect_uri = get_gmail_redirect_uri()
+
+    # Exchange code for tokens
+    token_url = 'https://oauth2.googleapis.com/token'
+    data = {
+        'code': auth_code,
+        'client_id': client_id,
+        'client_secret': client_secret,
+        'redirect_uri': redirect_uri,
+        'grant_type': 'authorization_code'
+    }
+
+    response = requests.post(token_url, data=data)
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"Token exchange failed: {response.text}")
+
+    tokens = response.json()
+
+    # Calculate expiration time
+    expires_at = datetime.now() + timedelta(seconds=tokens.get('expires_in', 3600))
+
+    # Best-effort: fetch the Gmail address for display / debugging.
+    email_address = None
+    try:
+        profile_resp = requests.get(
+            "https://www.googleapis.com/gmail/v1/users/me/profile",
+            headers={"Authorization": f"Bearer {tokens['access_token']}"},
+            timeout=10,
+        )
+        if profile_resp.status_code == 200:
+            email_address = (profile_resp.json() or {}).get("emailAddress")
+    except Exception:
+        pass
+
+    return {
+        'access_token': tokens['access_token'],
+        'refresh_token': tokens.get('refresh_token'),
+        'expires_at': expires_at.isoformat(),
+        'email': email_address
+    }
+
+def save_gmail_credentials(user_id: str, email: str, access_token: str, refresh_token: str, expires_at: str):
+    """Legacy: save Gmail OAuth credentials to token.json (single-user local dev)."""
+    cred_data = {
+        'token': access_token,
+        'refresh_token': refresh_token,
+        'token_uri': 'https://oauth2.googleapis.com/token',
+        'client_id': None,
+        'client_secret': None,
+        'scopes': SCOPES
+    }
+
+    # Load client info from credentials.json
+    try:
+        from backend.google_oauth import load_gmail_oauth_credentials
+        cred_data['client_id'], cred_data['client_secret'] = load_gmail_oauth_credentials()
+    except Exception:
+        # Keep legacy behavior if credentials are not configured via env.
+        if os.path.exists('credentials.json'):
+            with open('credentials.json', 'r') as f:
+                creds = json.load(f)
+                cred_type = 'web' if 'web' in creds else 'installed'
+                cred_data['client_id'] = creds[cred_type]['client_id']
+                cred_data['client_secret'] = creds[cred_type]['client_secret']
+
+    # Save to token.json
+    with open('token.json', 'w') as f:
+        json.dump(cred_data, f)
+
+    logger.info(f"Gmail credentials saved for user {user_id}")
+
+# ==================== OUTLOOK/MICROSOFT GRAPH FUNCTIONS ====================
+
+def get_outlook_auth_url() -> str:
+    """Generate Microsoft OAuth authorization URL"""
+    client_id = os.getenv('OUTLOOK_CLIENT_ID')
+    redirect_uri = os.getenv('OUTLOOK_REDIRECT_URI')
+
+    if not client_id or not redirect_uri:
+        raise ValueError("OUTLOOK_CLIENT_ID and OUTLOOK_REDIRECT_URI must be set in .env")
+
+    # Build authorization URL
+    auth_url = (
+        f"{OUTLOOK_AUTHORITY}/oauth2/v2.0/authorize?"
+        f"client_id={client_id}&"
+        f"response_type=code&"
+        f"redirect_uri={redirect_uri}&"
+        f"response_mode=query&"
+        f"scope={' '.join(OUTLOOK_SCOPES)}"
+    )
+
+    logger.info("Generated Outlook OAuth URL")
+    return auth_url
+
+def exchange_outlook_code_for_tokens(auth_code: str) -> Dict[str, Any]:
+    """
+    Exchange authorization code for access and refresh tokens
+    Returns dict with: access_token, refresh_token, expires_at
+    """
+    client_id = os.getenv('OUTLOOK_CLIENT_ID')
+    client_secret = os.getenv('OUTLOOK_CLIENT_SECRET')
+    redirect_uri = os.getenv('OUTLOOK_REDIRECT_URI')
+
+    if not all([client_id, client_secret, redirect_uri]):
+        raise ValueError("OUTLOOK_CLIENT_ID, OUTLOOK_CLIENT_SECRET, and OUTLOOK_REDIRECT_URI must be set")
+
+    # Create MSAL confidential client app
+    app = msal.ConfidentialClientApplication(
+        client_id,
+        authority=OUTLOOK_AUTHORITY,
+        client_credential=client_secret
+    )
+
+    # Acquire token by authorization code
+    # Only pass resource scopes, not OIDC scopes (MSAL handles offline_access automatically)
+    resource_scopes = ['Mail.Read', 'User.Read']
+    result = app.acquire_token_by_authorization_code(
+        auth_code,
+        scopes=resource_scopes,
+        redirect_uri=redirect_uri
+    )
+
+    if "access_token" not in result:
+        error_msg = result.get("error_description", result.get("error", "Unknown error"))
+        logger.error(f"Failed to acquire token: {error_msg}")
+        raise HTTPException(status_code=400, detail=f"Token acquisition failed: {error_msg}")
+
+    # Calculate expiration timestamp
+    expires_in = result.get('expires_in', 3600)
+    expires_at = datetime.now() + timedelta(seconds=expires_in)
+
+    logger.info("Successfully exchanged auth code for tokens")
+
+    return {
+        'access_token': result['access_token'],
+        'refresh_token': result.get('refresh_token'),
+        'expires_at': expires_at.isoformat(),
+        'email': result.get('id_token_claims', {}).get('preferred_username', 'unknown@outlook.com')
+    }
+
+def refresh_outlook_token(refresh_token: str) -> Dict[str, Any]:
+    """
+    Refresh expired Outlook access token
+    Returns new access_token and expires_at
+    """
+    client_id = os.getenv('OUTLOOK_CLIENT_ID')
+    client_secret = os.getenv('OUTLOOK_CLIENT_SECRET')
+
+    if not all([client_id, client_secret]):
+        raise ValueError("OUTLOOK_CLIENT_ID and OUTLOOK_CLIENT_SECRET must be set")
+
+    app = msal.ConfidentialClientApplication(
+        client_id,
+        authority=OUTLOOK_AUTHORITY,
+        client_credential=client_secret
+    )
+
+    result = app.acquire_token_by_refresh_token(
+        refresh_token,
+        scopes=OUTLOOK_SCOPES
+    )
+
+    if "access_token" not in result:
+        error_msg = result.get("error_description", "Token refresh failed")
+        logger.error(f"Failed to refresh token: {error_msg}")
+        raise HTTPException(status_code=401, detail=f"Token refresh failed: {error_msg}")
+
+    expires_in = result.get('expires_in', 3600)
+    expires_at = datetime.now() + timedelta(seconds=expires_in)
+
+    logger.info("Successfully refreshed Outlook token")
+
+    return {
+        'access_token': result['access_token'],
+        'refresh_token': result.get('refresh_token', refresh_token),  # Use new refresh token if provided
+        'expires_at': expires_at.isoformat()
+    }
+
+def save_outlook_credentials(user_id: str, email: str, access_token: str, refresh_token: str, expires_at: str):
+    """
+    Save Outlook credentials to local JSON file
+    TODO: Replace with Supabase insert into email_accounts table
+    """
+    credentials_file = Path("outlook_credentials.json")
+
+    credentials = {
+        'user_id': user_id,
+        'provider': 'outlook',
+        'email': email,
+        'access_token': access_token,
+        'refresh_token': refresh_token,
+        'expires_at': expires_at,
+        'created_at': datetime.now().isoformat()
+    }
+
+    # For now, just save to file (single user)
+    with open(credentials_file, 'w') as f:
+        json.dump(credentials, f, indent=2)
+
+    logger.info(f"Saved Outlook credentials for {email}")
+
+    # TODO: Insert into Supabase
+    # supabase.table('email_accounts').insert({
+    #     'user_id': user_id,
+    #     'provider': 'outlook',
+    #     'email': email,
+    #     'access_token': access_token,
+    #     'refresh_token': refresh_token,
+    #     'expires_at': expires_at
+    # }).execute()
+
+def load_outlook_credentials() -> Optional[Dict[str, Any]]:
+    """
+    Load Outlook credentials from local JSON file
+    TODO: Replace with Supabase query
+    """
+    credentials_file = Path("outlook_credentials.json")
+
+    if not credentials_file.exists():
+        return None
+
+    try:
+        with open(credentials_file, 'r') as f:
+            creds = json.load(f)
+
+        # Check if token is expired and refresh if needed
+        expires_at = datetime.fromisoformat(creds['expires_at'])
+        if datetime.now() >= expires_at - timedelta(minutes=5):  # Refresh 5 min before expiry
+            logger.info("Outlook token expired, refreshing...")
+            new_tokens = refresh_outlook_token(creds['refresh_token'])
+            creds['access_token'] = new_tokens['access_token']
+            creds['refresh_token'] = new_tokens['refresh_token']
+            creds['expires_at'] = new_tokens['expires_at']
+
+            # Save updated credentials
+            with open(credentials_file, 'w') as f:
+                json.dump(creds, f, indent=2)
+
+        return creds
+
+    except Exception as e:
+        logger.error(f"Error loading Outlook credentials: {str(e)}")
+        return None
+
+def fetch_outlook_messages(access_token: str, max_results: int = 50) -> List[Dict[str, Any]]:
+    """
+    Fetch recent email metadata from Outlook using Microsoft Graph API
+    Only fetches metadata fields (no full body content)
+    """
+    headers = {
+        'Authorization': f'Bearer {access_token}',
+        'Content-Type': 'application/json'
+    }
+
+    # Request only metadata fields
+    params = {
+        '$top': max_results,
+        '$select': 'id,subject,from,receivedDateTime,bodyPreview,webLink',
+        '$orderby': 'receivedDateTime desc'
+    }
+
+    try:
+        response = requests.get(
+            f"{OUTLOOK_GRAPH_ENDPOINT}/me/messages",
+            headers=headers,
+            params=params
+        )
+
+        if response.status_code == 401:
+            logger.error("Outlook access token expired or invalid")
+            raise HTTPException(status_code=401, detail="Outlook token expired")
+
+        response.raise_for_status()
+        data = response.json()
+
+        messages = data.get('value', [])
+        logger.info(f"Fetched {len(messages)} messages from Outlook")
+
+        return messages
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error fetching Outlook messages: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch Outlook messages: {str(e)}")
+
+def normalize_outlook_message(message: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize Outlook message to Obligo's internal format
+    Matches Gmail normalization format for frontend compatibility
+    """
+    # Extract sender email
+    from_field = message.get('from', {})
+    sender_email = from_field.get('emailAddress', {})
+    sender = f"{sender_email.get('name', 'Unknown')} <{sender_email.get('address', 'unknown@outlook.com')}>"
+
+    # Parse received datetime
+    received_dt = message.get('receivedDateTime', '')
+    try:
+        received_at = datetime.fromisoformat(received_dt.replace('Z', '+00:00'))
+    except:
+        received_at = datetime.now()
+
+    return {
+        'source': 'outlook',
+        'emailId': message.get('id', ''),
+        'subject': message.get('subject', 'No Subject'),
+        'sender': sender,
+        'snippet': message.get('bodyPreview', '')[:200],  # Limit snippet to 200 chars
+        'receivedAt': received_at,
+        'sourceLink': message.get('webLink', ''),
+        'full_text': message.get('bodyPreview', '')  # Use preview as full_text for analysis
+    }
+
+# ==================== CLAUDE AI FUNCTIONS ====================
+
+def analyze_email_with_claude(email_text: str) -> Dict:
+    """
+    Analyze email with Claude AI
+    Returns normalized obligation with TBD defaults for missing fields
+    """
+    try:
+        api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")
+        if not api_key:
+            raise ValueError("ANTHROPIC_API_KEY not set")
+        client = Anthropic(api_key=api_key)
+
+        prompt = f"""Analyze this email and determine if it contains something the reader may want to track or act on.
+
+Email:
+{email_text}
+
+Return ONLY valid JSON (no markdown, no explanation) with this structure:
+{{
+  "requires_action": true/false,
+  "summary": "brief neutral description",
+  "action": "what could be done",
+  "deadline": "YYYY-MM-DD or 'TBD'",
+  "deadline_implied": true/false,
+  "stakes": "neutral description of what this relates to",
+  "authority": "who sent this",
+  "blocking": true/false
+}}
+
+Rules:
+- If no deadline mentioned, use "TBD"
+- If authority unclear, use "TBD"
+- If no action needed, set requires_action: false
+- Look for multiple items in one email
+- Be concise, specific, and neutral in tone — describe facts, not pressure"""
+
+        message = client.messages.create(
+            model="claude-2.1",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": prompt}]
+        )
+
+        response_text = message.content[0].text.strip()
+        obligation = json.loads(response_text)
+
+        # Normalize all fields with defaults
+        normalized = {
+            "requires_action": obligation.get("requires_action", False),
+            "summary": normalize_value(obligation.get("summary"), "No summary"),
+            "action": normalize_value(obligation.get("action"), "Review email"),
+            "deadline": normalize_deadline(obligation.get("deadline")),
+            "deadline_implied": obligation.get("deadline_implied", False),
+            "stakes": normalize_value(obligation.get("stakes"), "Unknown impact"),
+            "authority": normalize_value(obligation.get("authority"), "Unknown sender"),
+            "blocking": obligation.get("blocking", False)
+        }
+
+        logger.info(f"Analyzed email: {normalized['summary'][:50]}...")
+        return normalized
+
+    except json.JSONDecodeError as e:
+        logger.error(f"Claude returned invalid JSON: {e}")
+        return {
+            "requires_action": False,
+            "summary": "Parse error",
+            "action": "TBD",
+            "deadline": "TBD",
+            "stakes": "TBD",
+            "authority": "TBD",
+            "blocking": False
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing email with Claude: {str(e)}")
+        raise
+
+# ==================== OBLIGATION CLASSIFICATION & ACTION PATHS ====================
+
+def classify_obligation_type(obligation: dict) -> str:
+    """
+    Classify obligation into types based on keyword matching.
+    Types: assignment, response, application, unknown
+
+    Rules:
+    - assignment: submit, assignment, homework, lab, project, due, grade
+    - response: reply, respond, let me know, answer, feedback, get back
+    - application: application, documents, portal, form, register, enroll
+    - unknown: default fallback
+    """
+    # Combine subject, summary, and action for keyword matching
+    text = " ".join([
+        obligation.get('summary', ''),
+        obligation.get('action', ''),
+        obligation.get('stakes', '')
+    ]).lower()
+
+    # Assignment keywords
+    assignment_keywords = ['submit', 'assignment', 'homework', 'lab', 'project',
+                          'due', 'grade', 'exam', 'quiz', 'paper', 'essay',
+                          'deliverable', 'milestone']
+
+    # Response keywords
+    response_keywords = ['reply', 'respond', 'let me know', 'answer', 'feedback',
+                        'get back', 'confirm', 'rsvp', 'update me', 'reach out']
+
+    # Application keywords
+    application_keywords = ['application', 'documents', 'portal', 'form',
+                           'register', 'enroll', 'apply', 'transcript',
+                           'recommendation', 'visa', 'admission']
+
+    # Check for matches (order matters: most specific first)
+    if any(keyword in text for keyword in assignment_keywords):
+        return 'assignment'
+    elif any(keyword in text for keyword in response_keywords):
+        return 'response'
+    elif any(keyword in text for keyword in application_keywords):
+        return 'application'
+    else:
+        return 'unknown'
+
+def get_action_path(obligation_type: str) -> list:
+    """
+    Return hardcoded action path steps based on obligation type.
+    These are simple, clear steps a student can follow.
+    No AI. No dynamic generation.
+    """
+    action_paths = {
+        'assignment': [
+            "Open the assignment instructions",
+            "Review requirements or rubric",
+            "Start or upload the work"
+        ],
+        'response': [
+            "Open the email",
+            "Draft a short reply",
+            "Send confirmation or answer"
+        ],
+        'application': [
+            "Open the application portal or email",
+            "Review required documents",
+            "Prepare missing items"
+        ],
+        'unknown': [
+            "Open the email",
+            "Read carefully",
+            "Decide next step"
+        ]
+    }
+
+    return action_paths.get(obligation_type, action_paths['unknown'])
+
+# ==================== SCORING FUNCTIONS ====================
+
+def calculate_deadline_score(deadline_str: str) -> int:
+    """Calculate urgency score based on deadline"""
+    if deadline_str == "TBD" or not deadline_str:
+        return 5
+
+    try:
+        deadline = datetime.strptime(deadline_str, "%Y-%m-%d")
+        today = datetime.now()
+        days_until = (deadline - today).days
+
+        if days_until < 0: return 15      # Overdue
+        if days_until == 0: return 12     # Today
+        if days_until <= 1: return 10     # Tomorrow
+        if days_until <= 3: return 8      # This week
+        if days_until <= 7: return 6      # Next week
+        if days_until <= 14: return 4     # Two weeks
+        return 2                           # Future
+    except:
+        return 5
+
+def calculate_authority_score(authority_str: str) -> int:
+    """Calculate score based on authority level"""
+    if not authority_str or authority_str == "TBD":
+        return 3
+
+    authority_lower = authority_str.lower()
+
+    if any(word in authority_lower for word in ['professor', 'prof', 'dr.', 'dean']):
+        return 10
+    elif any(word in authority_lower for word in ['manager', 'supervisor', 'boss', 'ceo', 'director']):
+        return 10
+    elif any(word in authority_lower for word in ['admin', 'administration', 'registrar']):
+        return 9
+    elif any(word in authority_lower for word in ['client', 'customer']):
+        return 8
+    elif any(word in authority_lower for word in ['team', 'colleague', 'coworker']):
+        return 5
+    return 3
+
+def calculate_stakes_score(stakes_str: str) -> int:
+    """Calculate score based on consequence severity"""
+    if not stakes_str or stakes_str == "TBD":
+        return 3
+
+    stakes_lower = stakes_str.lower()
+
+    high_impact = ['lose', 'fail', 'miss', 'ineligible', 'penalty', 'fired', 'expelled', 'rejected']
+    medium_impact = ['delay', 'postpone', 'late', 'behind', 'slow']
+
+    if any(word in stakes_lower for word in high_impact):
+        return 10
+    elif any(word in stakes_lower for word in medium_impact):
+        return 6
+    return 3
+
+def calculate_obligation_score(obligation: Dict) -> Dict:
+    """Calculate total priority score"""
+    deadline_score = calculate_deadline_score(obligation.get('deadline'))
+    authority_score = calculate_authority_score(obligation.get('authority'))
+    stakes_score = calculate_stakes_score(obligation.get('stakes'))
+    blocking_score = 8 if obligation.get('blocking') else 0
+    relevance_score = 5
+
+    total_score = (
+        deadline_score * 1.5 +
+        authority_score * 1.2 +
+        stakes_score * 1.3 +
+        blocking_score * 1.0 +
+        relevance_score * 0.5
+    )
+
+    return {
+        'total_score': round(total_score, 2),
+        'deadline_score': deadline_score,
+        'authority_score': authority_score,
+        'stakes_score': stakes_score,
+        'blocking_score': blocking_score,
+        'relevance_score': relevance_score
+    }
+
+def generate_micro_action(obligation: Dict) -> Dict:
+    """Generate micro-action and motivation"""
+    return {
+        'micro_action': f"Start by: {obligation['action'][:50]}...",
+        'motivation': "One small step can make this feel more manageable.",
+        'action_type': 'task',
+        'prepared_content': None,
+        'requires_approval': False,
+        'safety_flags': []
+    }
+
+# ==================== API ENDPOINTS ====================
+
+@app.get("/oauth/gmail")
+async def gmail_oauth_init(user_id: Optional[str] = None):
+    """
+    Initiate Gmail OAuth flow
+    Redirects user to Google consent screen
+    """
+    try:
+        state = None
+        if user_id:
+            state = _sign_oauth_state(
+                {"user_id": user_id, "nonce": str(uuid.uuid4()), "ts": int(time.time())}
+            )
+        auth_url = get_gmail_auth_url(state=state)
+        logger.info("Redirecting user to Gmail OAuth consent screen")
+        return RedirectResponse(url=auth_url)
+
+    except ValueError as e:
+        logger.error(f"Gmail OAuth configuration error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gmail OAuth not configured: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Error initiating Gmail OAuth: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to initiate OAuth: {str(e)}"
+        )
+
+@app.get("/oauth/gmail/callback")
+async def gmail_oauth_callback(code: str = None, error: str = None, state: Optional[str] = None):
+    """
+    Handle Gmail OAuth callback
+    Exchanges authorization code for tokens and stores credentials
+    """
+    # Handle OAuth errors
+    if error:
+        logger.error(f"Gmail OAuth error: {error}")
+        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        return RedirectResponse(url=f"{frontend_url}/emails?oauth_error={error}")
+
+    if not code:
+        logger.error("No authorization code received")
+        raise HTTPException(
+            status_code=400,
+            detail="No authorization code received"
+        )
+
+    try:
+        # Exchange code for tokens
+        tokens = exchange_gmail_code_for_tokens(code)
+
+        # If we have a signed state, store per-user connection in Supabase.
+        if state:
+            from backend.email_monitor import _get_supabase
+
+            payload = _verify_oauth_state(state)
+            user_id = payload.get("user_id")
+            if not user_id:
+                raise HTTPException(status_code=400, detail="Missing user_id in OAuth state")
+
+            sb = _get_supabase()
+            existing = sb.table("email_connections").select("*").eq("user_id", user_id).single().execute()
+            existing_data = existing.data or {}
+
+            sb.table("email_connections").upsert(
+                {
+                    "user_id": user_id,
+                    "provider": "gmail",
+                    "access_token": tokens["access_token"],
+                    # Google may not return refresh_token on subsequent consents.
+                    "refresh_token": tokens.get("refresh_token") or existing_data.get("refresh_token"),
+                    "token_expiry": tokens.get("expires_at"),
+                    "email_address": tokens.get("email") or existing_data.get("email_address"),
+                    "is_active": True,
+                },
+                on_conflict="user_id",
+            ).execute()
+        else:
+            # Legacy single-user local dev (writes token.json)
+            save_gmail_credentials(
+                user_id="default_user",
+                email=tokens.get("email") or "gmail_user",
+                access_token=tokens["access_token"],
+                refresh_token=tokens.get("refresh_token"),
+                expires_at=tokens.get("expires_at"),
+            )
+
+        logger.info(f"Gmail OAuth successful for {tokens.get('email')}")
+
+        # Redirect back to frontend with success
+        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        return RedirectResponse(url=f"{frontend_url}/emails?oauth_success=gmail")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in Gmail OAuth callback: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"OAuth callback failed: {str(e)}"
+        )
+
+@app.get("/oauth/outlook")
+async def outlook_oauth_init():
+    """
+    Initiate Outlook OAuth flow
+    Redirects user to Microsoft consent screen
+    """
+    try:
+        auth_url = get_outlook_auth_url()
+        logger.info("Redirecting user to Outlook OAuth consent screen")
+        return RedirectResponse(url=auth_url)
+
+    except ValueError as e:
+        logger.error(f"Outlook OAuth configuration error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Outlook OAuth not configured: {str(e)}"
+        )
+    except Exception as e:
+        logger.error(f"Error initiating Outlook OAuth: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to initiate OAuth: {str(e)}"
+        )
+
+@app.get("/oauth/outlook/callback")
+async def outlook_oauth_callback(code: str = None, error: str = None):
+    """
+    Handle Outlook OAuth callback
+    Exchanges authorization code for tokens and stores credentials
+    """
+    # Handle OAuth errors
+    if error:
+        logger.error(f"Outlook OAuth error: {error}")
+        # Redirect to frontend with error
+        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        return RedirectResponse(url=f"{frontend_url}?oauth_error={error}")
+
+    if not code:
+        logger.error("No authorization code received")
+        raise HTTPException(
+            status_code=400,
+            detail="No authorization code received"
+        )
+
+    try:
+        # Exchange code for tokens
+        tokens = exchange_outlook_code_for_tokens(code)
+
+        # Save credentials (user_id is 'default_user' for now)
+        save_outlook_credentials(
+            user_id='default_user',
+            email=tokens['email'],
+            access_token=tokens['access_token'],
+            refresh_token=tokens['refresh_token'],
+            expires_at=tokens['expires_at']
+        )
+
+        logger.info(f"Outlook OAuth successful for {tokens['email']}")
+
+        # Redirect back to frontend with success
+        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        return RedirectResponse(url=f"{frontend_url}/connect?oauth_success=outlook")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in Outlook OAuth callback: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"OAuth callback failed: {str(e)}"
+        )
+
+@app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": "Obligo API",
+        "version": "1.0.0",
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.get("/daily_digest/")
+async def daily_digest(top_n: int = 5, provider: str = "all"):
+    """
+    Get daily digest of top obligations from Gmail and/or Outlook
+    Handles edge cases and always returns valid JSON
+
+    Args:
+        top_n: Number of top obligations to return
+        provider: 'gmail', 'outlook', or 'all' (default)
+    """
+    try:
+        all_emails = []
+        sources_used = []
+
+        # Fetch Gmail emails if configured and requested
+        gmail_configured = os.path.exists('credentials.json') and os.path.exists('token.json')
+        if (provider in ['gmail', 'all']) and gmail_configured:
+            try:
+                gmail_emails = fetch_gmail_emails(max_results=50)
+                # Add source identifier to each email
+                for email in gmail_emails:
+                    email['source'] = 'gmail'
+                all_emails.extend(gmail_emails)
+                sources_used.append('gmail')
+                logger.info(f"Fetched {len(gmail_emails)} emails from Gmail")
+            except Exception as e:
+                logger.error(f"Error fetching Gmail emails: {str(e)}")
+
+        # Fetch Outlook emails if configured and requested
+        outlook_creds = load_outlook_credentials()
+        if (provider in ['outlook', 'all']) and outlook_creds:
+            try:
+                outlook_messages = fetch_outlook_messages(
+                    outlook_creds['access_token'],
+                    max_results=50
+                )
+                # Normalize Outlook messages to match Gmail format
+                outlook_emails = [normalize_outlook_message(msg) for msg in outlook_messages]
+                all_emails.extend(outlook_emails)
+                sources_used.append('outlook')
+                logger.info(f"Fetched {len(outlook_messages)} emails from Outlook")
+            except Exception as e:
+                logger.error(f"Error fetching Outlook emails: {str(e)}")
+
+        # If no emails fetched from any source, return demo data
+        if len(all_emails) == 0:
+            logger.warning("No email sources configured, returning demo data")
+            return {
+                "message": "No email sources configured. Showing demo data.",
+                "sources": [],
+                "total_obligations": len(get_demo_obligations()),
+                "top_obligations": get_demo_obligations()[:top_n]
+            }
+
+        # Analyze all emails with Claude
+        obligations = []
+        api_failed = False  # Track if API is unavailable
+
+        for email in all_emails:
+            # Skip analysis if API already failed (no credits, etc.)
+            if api_failed:
+                continue
+
+            try:
+                analysis = analyze_email_with_claude(email['full_text'])
+
+                if analysis.get('requires_action'):
+                    # Add source information to obligation
+                    analysis['email_source'] = email.get('source', 'unknown')
+                    analysis['email_id'] = email.get('emailId', email.get('id', ''))
+                    analysis['sender'] = email.get('sender', 'Unknown')
+                    analysis['sourceLink'] = email.get('sourceLink', '')
+                    obligations.append(analysis)
+
+            except Exception as e:
+                error_msg = str(e)
+                logger.error(f"Error analyzing email: {error_msg}")
+                # If API credits are low, skip all remaining emails
+                if 'credit balance' in error_msg.lower() or '400' in error_msg:
+                    logger.warning("API unavailable - skipping remaining emails, using demo data")
+                    api_failed = True
+                continue
+
+        # Score and rank obligations
+        scored_obligations = []
+        for obl in obligations:
+            scores = calculate_obligation_score(obl)
+            obl.update(scores)
+            scored_obligations.append(obl)
+
+        scored_obligations.sort(key=lambda x: x['total_score'], reverse=True)
+        top_obligations = scored_obligations[:top_n]
+
+        # Add micro-actions, obligation IDs, type, and action paths
+        for idx, obl in enumerate(top_obligations, 1):
+            obl['obligation_id'] = f"obl_{datetime.now().strftime('%Y%m%d')}_{idx}"
+            micro_action = generate_micro_action(obl)
+            obl.update(micro_action)
+
+            # Add obligation type and action path
+            obl['type'] = classify_obligation_type(obl)
+            obl['actionPath'] = get_action_path(obl['type'])
+
+        logger.info(f"Returning {len(top_obligations)} obligations from {', '.join(sources_used)}")
+
+        # If no obligations found, return demo data
+        if len(top_obligations) == 0:
+            logger.warning("No obligations found, returning demo data")
+            return {
+                "message": "Nothing stood out from your emails. Showing sample data.",
+                "sources": sources_used,
+                "total_obligations": len(get_demo_obligations()),
+                "top_obligations": get_demo_obligations()[:top_n]
+            }
+
+        return {
+            "sources": sources_used,
+            "total_obligations": len(obligations),
+            "top_obligations": top_obligations
+        }
+
+    except Exception as e:
+        logger.error(f"Error in daily_digest: {str(e)}")
+        # Always return demo data on error
+        return {
+            "message": f"Error occurred: {str(e)[:100]}. Showing demo data.",
+            "sources": [],
+            "total_obligations": len(get_demo_obligations()),
+            "top_obligations": get_demo_obligations()[:top_n]
+        }
+
+@app.post("/approve_action/")
+async def approve_action(request: MicroActionRequest):
+    """
+    Approve, review, or skip an obligation
+    Logs action to action_log.json (Supabase-ready)
+    """
+    try:
+        # Log the action
+        log_action(
+            obligation_id=request.obligation_id,
+            action="user_action",
+            approval_status=request.approval_status,
+            score=0.0,  # Score would come from obligation data
+            notes=request.user_notes
+        )
+
+        logger.info(f"Action approved: {request.obligation_id} - {request.approval_status}")
+
+        return {
+            "status": "success",
+            "message": f"Obligation {request.approval_status}",
+            "obligation_id": request.obligation_id,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        logger.error(f"Error approving action: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Failed to approve action",
+                "message": str(e),
+                "timestamp": datetime.now().isoformat()
+            }
+        )
+
+@app.get("/trigger_daily_check/")
+async def trigger_daily_check():
+    """Manually trigger daily obligation check"""
+    try:
+        logger.info("Manual daily check triggered")
+        return {
+            "status": "success",
+            "message": "Daily check triggered",
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        logger.error(f"Error triggering daily check: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/action_log/")
+async def get_action_log():
+    """Get action log (for debugging/admin)"""
+    try:
+        log_file = Path("action_log.json")
+        if log_file.exists():
+            with open(log_file, 'r') as f:
+                logs = json.load(f)
+            return {"logs": logs, "count": len(logs)}
+        return {"logs": [], "count": 0}
+    except Exception as e:
+        logger.error(f"Error reading action log: {str(e)}")
+        return {"logs": [], "count": 0, "error": str(e)}
+
+# ==================== EXECUTION ENDPOINTS ====================
+
+def generate_demo_action_plan(obligation_id: str, obligation_summary: str) -> ActionPlan:
+    """Generate a demo action plan based on obligation type"""
+    summary_lower = obligation_summary.lower()
+
+    if any(word in summary_lower for word in ['proposal', 'document', 'report']):
+        steps = [
+            ActionStep(step_id=1, description="Open the document draft", estimated_minutes=2),
+            ActionStep(step_id=2, description="Review and finalize content", estimated_minutes=15),
+            ActionStep(step_id=3, description="Add pricing/details section", estimated_minutes=10),
+            ActionStep(step_id=4, description="Proofread for errors", estimated_minutes=5),
+            ActionStep(step_id=5, description="Send to recipient", url="https://mail.google.com", estimated_minutes=3),
+        ]
+    elif any(word in summary_lower for word in ['email', 'respond', 'reply', 'professor']):
+        steps = [
+            ActionStep(step_id=1, description="Open email thread", url="https://mail.google.com", estimated_minutes=1),
+            ActionStep(step_id=2, description="Draft your response", estimated_minutes=5),
+            ActionStep(step_id=3, description="Review tone and content", estimated_minutes=2),
+            ActionStep(step_id=4, description="Send the email", estimated_minutes=1),
+        ]
+    elif any(word in summary_lower for word in ['review', 'pull request', 'code', 'github']):
+        steps = [
+            ActionStep(step_id=1, description="Open the pull request", url="https://github.com", estimated_minutes=1),
+            ActionStep(step_id=2, description="Review code changes", estimated_minutes=10),
+            ActionStep(step_id=3, description="Test locally if needed", estimated_minutes=5),
+            ActionStep(step_id=4, description="Leave feedback or approve", estimated_minutes=3),
+        ]
+    else:
+        steps = [
+            ActionStep(step_id=1, description="Open the relevant document or page", estimated_minutes=2),
+            ActionStep(step_id=2, description="Review the requirements", estimated_minutes=5),
+            ActionStep(step_id=3, description="Complete the main task", estimated_minutes=15),
+            ActionStep(step_id=4, description="Verify and submit", estimated_minutes=3),
+        ]
+
+    total_minutes = sum(s.estimated_minutes for s in steps)
+
+    return ActionPlan(
+        obligation_id=obligation_id,
+        title=f"Action Plan: {obligation_summary[:50]}",
+        steps=steps,
+        total_estimated_minutes=total_minutes
+    )
+
+@app.get("/api/obligations/{obligation_id}/action_plan")
+async def get_action_plan(obligation_id: str, summary: str = "Complete this task"):
+    """
+    Get or generate an action plan for an obligation
+    """
+    try:
+        # Check if plan already exists
+        if obligation_id in action_plans_db:
+            plan = action_plans_db[obligation_id]
+            # Add completion status from progress db
+            progress = execution_progress_db.get(obligation_id, {})
+            steps_with_progress = []
+            for step in plan.steps:
+                step_dict = step.dict()
+                step_dict['completed'] = progress.get(step.step_id, False)
+                steps_with_progress.append(step_dict)
+
+            return {
+                "obligation_id": plan.obligation_id,
+                "title": plan.title,
+                "steps": steps_with_progress,
+                "total_estimated_minutes": plan.total_estimated_minutes
+            }
+
+        # Generate new plan (demo version - would use Claude API with credits)
+        plan = generate_demo_action_plan(obligation_id, summary)
+        action_plans_db[obligation_id] = plan
+        execution_progress_db[obligation_id] = {}
+
+        logger.info(f"Generated action plan for {obligation_id}")
+
+        return {
+            "obligation_id": plan.obligation_id,
+            "title": plan.title,
+            "steps": [s.dict() for s in plan.steps],
+            "total_estimated_minutes": plan.total_estimated_minutes
+        }
+
+    except Exception as e:
+        logger.error(f"Error generating action plan: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/obligations/{obligation_id}/steps/{step_id}/complete")
+async def complete_step(obligation_id: str, step_id: int):
+    """Mark a step as completed"""
+    try:
+        if obligation_id not in execution_progress_db:
+            execution_progress_db[obligation_id] = {}
+
+        execution_progress_db[obligation_id][step_id] = True
+
+        # Calculate progress
+        plan = action_plans_db.get(obligation_id)
+        if plan:
+            total_steps = len(plan.steps)
+            completed_steps = sum(1 for s in plan.steps if execution_progress_db[obligation_id].get(s.step_id, False))
+            progress_percent = (completed_steps / total_steps) * 100 if total_steps > 0 else 0
+        else:
+            progress_percent = 0
+            completed_steps = 0
+            total_steps = 0
+
+        logger.info(f"Step {step_id} completed for {obligation_id}")
+
+        return {
+            "status": "success",
+            "step_id": step_id,
+            "completed": True,
+            "progress_percent": progress_percent,
+            "completed_steps": completed_steps,
+            "total_steps": total_steps
+        }
+
+    except Exception as e:
+        logger.error(f"Error completing step: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/obligations/{obligation_id}/progress")
+async def get_progress(obligation_id: str):
+    """Get execution progress for an obligation"""
+    try:
+        progress = execution_progress_db.get(obligation_id, {})
+        plan = action_plans_db.get(obligation_id)
+
+        if not plan:
+            return {"progress_percent": 0, "completed_steps": 0, "total_steps": 0}
+
+        total_steps = len(plan.steps)
+        completed_steps = sum(1 for s in plan.steps if progress.get(s.step_id, False))
+        progress_percent = (completed_steps / total_steps) * 100 if total_steps > 0 else 0
+
+        return {
+            "progress_percent": progress_percent,
+            "completed_steps": completed_steps,
+            "total_steps": total_steps,
+            "steps": {s.step_id: progress.get(s.step_id, False) for s in plan.steps}
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting progress: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==================== ACTIVITY HISTORY ENDPOINTS ====================
+
+@app.get("/api/activity/timeline")
+async def get_activity_timeline(period: str = "7_days"):
+    """Get activity timeline grouped by date"""
+    try:
+        log_file = Path("action_log.json")
+        if not log_file.exists():
+            return {"timeline": [], "total_count": 0}
+
+        with open(log_file, 'r') as f:
+            logs = json.load(f)
+
+        # Calculate date range
+        today = datetime.now()
+        if period == "today":
+            start_date = today.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif period == "7_days":
+            start_date = today - timedelta(days=7)
+        elif period == "30_days":
+            start_date = today - timedelta(days=30)
+        else:
+            start_date = today - timedelta(days=7)
+
+        # Filter and group by date
+        filtered_logs = []
+        for log in logs:
+            try:
+                log_date = datetime.fromisoformat(log['timestamp'])
+                if log_date >= start_date:
+                    filtered_logs.append({
+                        **log,
+                        'date': log_date.strftime('%Y-%m-%d'),
+                        'time': log_date.strftime('%I:%M %p')
+                    })
+            except:
+                continue
+
+        # Group by date
+        grouped = {}
+        for log in filtered_logs:
+            date_key = log['date']
+            if date_key not in grouped:
+                grouped[date_key] = []
+            grouped[date_key].append(log)
+
+        # Convert to list sorted by date descending
+        timeline = [
+            {"date": date, "activities": activities}
+            for date, activities in sorted(grouped.items(), reverse=True)
+        ]
+
+        return {
+            "timeline": timeline,
+            "total_count": len(filtered_logs),
+            "period": period
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting activity timeline: {str(e)}")
+        return {"timeline": [], "total_count": 0, "error": str(e)}
+
+@app.get("/api/activity/stats")
+async def get_activity_stats(period: str = "7_days"):
+    """Get activity statistics"""
+    try:
+        log_file = Path("action_log.json")
+        if not log_file.exists():
+            return {
+                "obligations_completed": 0,
+                "steps_completed": 0,
+                "total_activities": 0,
+                "most_productive_day": None,
+                "streak_days": 0
+            }
+
+        with open(log_file, 'r') as f:
+            logs = json.load(f)
+
+        # Calculate date range
+        today = datetime.now()
+        if period == "today":
+            start_date = today.replace(hour=0, minute=0, second=0, microsecond=0)
+        elif period == "7_days":
+            start_date = today - timedelta(days=7)
+        elif period == "30_days":
+            start_date = today - timedelta(days=30)
+        else:
+            start_date = today - timedelta(days=7)
+
+        # Filter logs
+        filtered_logs = []
+        for log in logs:
+            try:
+                log_date = datetime.fromisoformat(log['timestamp'])
+                if log_date >= start_date:
+                    filtered_logs.append(log)
+            except:
+                continue
+
+        # Calculate stats
+        obligations_completed = sum(1 for log in filtered_logs if log.get('approval_status') == 'done')
+
+        # Count by day for most productive
+        day_counts = {}
+        for log in filtered_logs:
+            try:
+                log_date = datetime.fromisoformat(log['timestamp']).strftime('%A')
+                day_counts[log_date] = day_counts.get(log_date, 0) + 1
+            except:
+                continue
+
+        most_productive_day = max(day_counts, key=day_counts.get) if day_counts else None
+
+        # Calculate streak (consecutive days with activity)
+        activity_dates = set()
+        for log in logs:
+            try:
+                log_date = datetime.fromisoformat(log['timestamp']).date()
+                activity_dates.add(log_date)
+            except:
+                continue
+
+        streak = 0
+        check_date = today.date()
+        while check_date in activity_dates:
+            streak += 1
+            check_date -= timedelta(days=1)
+
+        return {
+            "obligations_completed": obligations_completed,
+            "steps_completed": len([l for l in filtered_logs if 'step' in str(l.get('action', '')).lower()]),
+            "total_activities": len(filtered_logs),
+            "most_productive_day": most_productive_day,
+            "streak_days": streak,
+            "period": period
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting activity stats: {str(e)}")
+        return {
+            "obligations_completed": 0,
+            "steps_completed": 0,
+            "total_activities": 0,
+            "most_productive_day": None,
+            "streak_days": 0,
+            "error": str(e)
+        }
+
+@app.delete("/api/activity/clear")
+async def clear_old_activities(days: int = 30):
+    """Clear activities older than specified days"""
+    try:
+        log_file = Path("action_log.json")
+        if not log_file.exists():
+            return {"deleted_count": 0}
+
+        with open(log_file, 'r') as f:
+            logs = json.load(f)
+
+        cutoff_date = datetime.now() - timedelta(days=days)
+
+        new_logs = []
+        deleted_count = 0
+        for log in logs:
+            try:
+                log_date = datetime.fromisoformat(log['timestamp'])
+                if log_date >= cutoff_date:
+                    new_logs.append(log)
+                else:
+                    deleted_count += 1
+            except:
+                new_logs.append(log)
+
+        with open(log_file, 'w') as f:
+            json.dump(new_logs, f, indent=2)
+
+        logger.info(f"Cleared {deleted_count} old activities")
+        return {"deleted_count": deleted_count, "remaining": len(new_logs)}
+
+    except Exception as e:
+        logger.error(f"Error clearing activities: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==================== MANUAL OBLIGATION ENDPOINTS ====================
+
+class ManualObligation(BaseModel):
+    title: str
+    description: Optional[str] = None
+    deadline: str
+    priority: str = "medium"
+    category: Optional[str] = None
+    source: str = "manual"
+
+class NLPCreateRequest(BaseModel):
+    text: str
+
+# In-memory store for manual obligations
+manual_obligations_db: Dict[str, Dict] = {}
+
+@app.post("/api/obligations/create")
+async def create_manual_obligation(obligation: ManualObligation):
+    """Let users manually create obligations"""
+    try:
+        if obligation.priority not in ["high", "medium", "low"]:
+            raise HTTPException(status_code=400, detail="Priority must be high, medium, or low")
+
+        obligation_id = f"obl_{int(datetime.now().timestamp())}_{len(manual_obligations_db)}"
+
+        new_obligation = {
+            "obligation_id": obligation_id,
+            "summary": obligation.title,
+            "action": obligation.description or obligation.title,
+            "deadline": obligation.deadline,
+            "priority": obligation.priority,
+            "category": obligation.category,
+            "source": obligation.source,
+            "status": "pending",
+            "sender": "You",
+            "total_score": 45 if obligation.priority == "high" else (30 if obligation.priority == "medium" else 15),
+            "created_at": datetime.now().isoformat()
+        }
+
+        manual_obligations_db[obligation_id] = new_obligation
+
+        # Log activity
+        log_file = Path("action_log.json")
+        logs = []
+        if log_file.exists():
+            with open(log_file, 'r') as f:
+                logs = json.load(f)
+
+        logs.append({
+            "timestamp": datetime.now().isoformat(),
+            "user_id": "default_user",
+            "obligation_id": obligation_id,
+            "action": f"Created: {obligation.title}",
+            "approval_status": "pending",
+            "source": obligation.source
+        })
+
+        with open(log_file, 'w') as f:
+            json.dump(logs, f, indent=2)
+
+        logger.info(f"Manual obligation created: {obligation.title}")
+
+        return {
+            "success": True,
+            "obligation": new_obligation,
+            "message": "Obligation created successfully"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error creating obligation: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/obligations/create-from-text")
+async def create_obligation_from_text(req: NLPCreateRequest):
+    """Parse natural language and create obligation (demo mode)"""
+    try:
+        text = req.text.lower()
+
+        # Demo NLP parsing - extract key details from text
+        title = req.text.strip()
+        if len(title) > 60:
+            title = title[:57] + "..."
+
+        # Detect priority
+        priority = "medium"
+        if any(w in text for w in ["urgent", "asap", "critical", "high priority", "immediately"]):
+            priority = "high"
+        elif any(w in text for w in ["low", "whenever", "no rush", "eventually"]):
+            priority = "low"
+
+        # Detect deadline
+        deadline = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+        if "tomorrow" in text:
+            deadline = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+        elif "today" in text:
+            deadline = datetime.now().strftime("%Y-%m-%d")
+        elif "next week" in text:
+            deadline = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+        elif "next friday" in text:
+            days_ahead = 4 - datetime.now().weekday()
+            if days_ahead <= 0:
+                days_ahead += 7
+            deadline = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+        elif "end of month" in text or "by end of month" in text:
+            import calendar
+            last_day = calendar.monthrange(datetime.now().year, datetime.now().month)[1]
+            deadline = datetime.now().replace(day=last_day).strftime("%Y-%m-%d")
+        else:
+            # Try to find dates like "march 1", "feb 15", etc.
+            import re as re_mod
+            months = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                      "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+                      "january": 1, "february": 2, "march": 3, "april": 4,
+                      "june": 6, "july": 7, "august": 8, "september": 9,
+                      "october": 10, "november": 11, "december": 12}
+            for month_name, month_num in months.items():
+                pattern = rf'{month_name}\s+(\d{{1,2}})'
+                match = re_mod.search(pattern, text)
+                if match:
+                    day = int(match.group(1))
+                    year = datetime.now().year
+                    try:
+                        parsed_date = datetime(year, month_num, day)
+                        if parsed_date < datetime.now():
+                            parsed_date = datetime(year + 1, month_num, day)
+                        deadline = parsed_date.strftime("%Y-%m-%d")
+                    except ValueError:
+                        pass
+                    break
+
+        # Detect category
+        category = "general"
+        if any(w in text for w in ["tuition", "fee", "payment", "deposit", "financial"]):
+            category = "financial"
+        elif any(w in text for w in ["housing", "apartment", "dorm", "rent"]):
+            category = "housing"
+        elif any(w in text for w in ["application", "apply", "submit", "transcript"]):
+            category = "application"
+        elif any(w in text for w in ["register", "enrollment", "class", "course"]):
+            category = "registration"
+
+        # Clean up title - remove filler words
+        clean_title = req.text.strip()
+        for prefix in ["remind me to ", "i need to ", "add ", "don't forget to ", "remember to "]:
+            if clean_title.lower().startswith(prefix):
+                clean_title = clean_title[len(prefix):]
+                break
+        clean_title = clean_title[0].upper() + clean_title[1:] if clean_title else req.text
+
+        # Create the obligation
+        obligation = ManualObligation(
+            title=clean_title,
+            description=req.text,
+            deadline=deadline,
+            priority=priority,
+            category=category,
+            source="manual_nlp"
+        )
+
+        result = await create_manual_obligation(obligation)
+
+        return {
+            **result,
+            "parsed_from": req.text,
+            "extracted": {
+                "title": clean_title,
+                "deadline": deadline,
+                "priority": priority,
+                "category": category
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"Error parsing text obligation: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/api/obligations/{obligation_id}")
+async def update_obligation(obligation_id: str, updates: dict):
+    """Update an existing obligation"""
+    try:
+        allowed_fields = ["title", "description", "deadline", "priority", "category", "status"]
+        filtered_updates = {k: v for k, v in updates.items() if k in allowed_fields}
+
+        if obligation_id in manual_obligations_db:
+            for key, value in filtered_updates.items():
+                if key == "title":
+                    manual_obligations_db[obligation_id]["summary"] = value
+                manual_obligations_db[obligation_id][key] = value
+
+            logger.info(f"Obligation updated: {obligation_id}")
+
+        return {
+            "success": True,
+            "obligation_id": obligation_id,
+            "updated_fields": filtered_updates
+        }
+
+    except Exception as e:
+        logger.error(f"Error updating obligation: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/obligations/manual")
+async def get_manual_obligations():
+    """Get all manually created obligations"""
+    try:
+        return {
+            "obligations": list(manual_obligations_db.values()),
+            "count": len(manual_obligations_db)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==================== AI CHAT ENDPOINTS ====================
+
+class ChatMessage(BaseModel):
+    message: str
+    context: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    response: str
+    suggestions: Optional[List[str]] = None
+
+# In-memory chat history (would use Supabase in production)
+chat_history_db: Dict[str, List[Dict]] = {}
+
+def get_demo_chat_response(message: str, obligations: List[Dict] = None) -> ChatResponse:
+    """Generate demo chat responses based on keywords"""
+    message_lower = message.lower()
+
+    # Detect creation intent
+    creation_keywords = ["remind me", "add", "i need to", "don't forget", "remember to", "create"]
+    if any(keyword in message_lower for keyword in creation_keywords):
+        return ChatResponse(
+            response=f"I can track that for you. Click the '+ Add' button in the top bar, or use the Natural Language mode to say:\n\n\"{message}\"\n\nI'll extract the title, date, and relevance automatically.",
+            suggestions=["Add item", "What stands out today?", "Help me think through priorities"]
+        )
+
+    # Check for obligation-related questions
+    if any(word in message_lower for word in ['what', 'obligation', 'task', 'do i have', 'pending', 'stands out']):
+        if obligations:
+            task_list = "\n".join([f"• {o.get('summary', 'Item')}" for o in obligations[:3]])
+            return ChatResponse(
+                response=f"Here are {len(obligations)} items that stand out:\n\n{task_list}\n\nWould you like to think through which ones matter most right now?",
+                suggestions=["Think through priorities", "Show upcoming dates", "Help me start"]
+            )
+        return ChatResponse(
+            response="Nothing stands out right now. Your inbox looks clear.",
+            suggestions=["Check inbox again", "Show completed items", "Add something to track"]
+        )
+
+    # Priority questions
+    if any(word in message_lower for word in ['priority', 'urgent', 'important', 'first', 'priorities']):
+        return ChatResponse(
+            response="Looking at what you have, the items with the closest dates tend to matter most. I can sort by date or by relevance — your call.",
+            suggestions=["Sort by date", "Sort by relevance", "Show what matters most"]
+        )
+
+    # Help with specific task
+    if any(word in message_lower for word in ['help', 'how', 'start', 'begin']):
+        return ChatResponse(
+            response="I can break any item into smaller steps if that helps. Click 'What are my options?' on any item to see a step-by-step guide.",
+            suggestions=["Show steps", "Quick tips", "Think through timing"]
+        )
+
+    # Time management
+    if any(word in message_lower for word in ['time', 'schedule', 'when', 'busy']):
+        return ChatResponse(
+            response="Based on what you have, it looks like about 45 minutes of focused time could address most items. Want me to help think through a plan?",
+            suggestions=["Suggest a plan", "Block time", "Set aside for later"]
+        )
+
+    # Greeting
+    if any(word in message_lower for word in ['hi', 'hello', 'hey', 'morning', 'afternoon']):
+        return ChatResponse(
+            response="Hello! I can help you think through what matters most today, surface relevant context, or break something down into steps. What's on your mind?",
+            suggestions=["What stands out today?", "Help me think through priorities", "Show upcoming dates"]
+        )
+
+    # Default response
+    return ChatResponse(
+        response="I can help you think through what matters, surface context from your inbox, or break items into steps. What would be most helpful?",
+        suggestions=["What stands out today?", "Help me think through priorities", "Show upcoming dates"]
+    )
+
+@app.post("/api/chat/message")
+async def send_chat_message(chat: ChatMessage):
+    """Send a message to the AI assistant"""
+    try:
+        # Get current obligations for context
+        obligations = []
+        try:
+            # Try to get real obligations, fall back to demo
+            log_file = Path("action_log.json")
+            if log_file.exists():
+                with open(log_file, 'r') as f:
+                    logs = json.load(f)
+                    # Filter for pending/incomplete
+                    obligations = [l for l in logs if l.get('approval_status') != 'done'][-5:]
+        except:
+            pass
+
+        # Generate response (demo mode since API credits are low)
+        response = get_demo_chat_response(chat.message, obligations)
+
+        logger.info(f"Chat message processed: {chat.message[:50]}...")
+
+        return {
+            "response": response.response,
+            "suggestions": response.suggestions,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        logger.error(f"Error processing chat message: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/chat/quick_question")
+async def quick_question(question: str = "What should I focus on?"):
+    """Get a quick answer about obligations"""
+    try:
+        # Demo quick answers based on question type
+        question_lower = question.lower()
+
+        if "focus" in question_lower or "priority" in question_lower:
+            answer = "Items with the closest dates tend to stand out most. You can review them on your dashboard and decide what feels right to focus on."
+        elif "deadline" in question_lower:
+            answer = "Your nearest date is shown on each item card. Amber indicators highlight items coming up soon."
+        elif "complete" in question_lower or "done" in question_lower:
+            answer = "Mark items as done using the checkmark button, or click 'What are my options?' for step-by-step guidance."
+        else:
+            answer = "I can help you think through what matters most. Ask about priorities, upcoming dates, or how to approach specific items."
+
+        return {
+            "question": question,
+            "answer": answer,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        logger.error(f"Error with quick question: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/voice/morning-briefing")
+async def get_morning_briefing():
+    """Get a text briefing suitable for text-to-speech"""
+    try:
+        # Get today's obligations count
+        log_file = Path("action_log.json")
+        pending_count = 0
+        completed_today = 0
+
+        if log_file.exists():
+            with open(log_file, 'r') as f:
+                logs = json.load(f)
+                today = datetime.now().date()
+                for log in logs:
+                    try:
+                        log_date = datetime.fromisoformat(log['timestamp']).date()
+                        if log_date == today and log.get('approval_status') == 'done':
+                            completed_today += 1
+                    except:
+                        continue
+
+        # Generate briefing text
+        hour = datetime.now().hour
+        if hour < 12:
+            greeting = "Good morning"
+        elif hour < 17:
+            greeting = "Good afternoon"
+        else:
+            greeting = "Good evening"
+
+        briefing = f"{greeting}. Here's what stands out today. "
+
+        if completed_today > 0:
+            briefing += f"You've addressed {completed_today} item{'s' if completed_today != 1 else ''} today. "
+
+        briefing += "You can check your inbox for anything new, or review what's on your dashboard. "
+        briefing += "If anything feels unclear, you can break it into steps. "
+        briefing += "Take it at your own pace."
+
+        return {
+            "briefing": briefing,
+            "greeting": greeting,
+            "completed_today": completed_today,
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except Exception as e:
+        logger.error(f"Error generating morning briefing: {str(e)}")
+        return {
+            "briefing": "Good day. Here is what stands out today. Check your dashboard to see what's there.",
+            "greeting": "Hello",
+            "completed_today": 0,
+            "error": str(e)
+        }
+
+# ==================== TRADEOFFS ENGINE ====================
+
+TRADEOFFS_DB = {
+    "fafsa": {
+        "title": "FAFSA Application",
+        "tradeoffs": [
+            {"text": "Federal grants average $6,895/year — requires FAFSA on file", "level": "notable"},
+            {"text": "Federal student loans are only available through FAFSA", "level": "notable"},
+            {"text": "State aid deadlines are often tied to FAFSA completion", "level": "moderate"},
+            {"text": "Many scholarships require FAFSA as a prerequisite", "level": "moderate"},
+        ],
+        "totalCost": "$27,580+",
+        "costPeriod": "over 4 years",
+    },
+    "housing": {
+        "title": "Housing Deposit",
+        "tradeoffs": [
+            {"text": "Deposit ($300-$500) is typically non-refundable", "level": "notable"},
+            {"text": "On-campus housing is usually reserved through this deposit", "level": "notable"},
+            {"text": "Off-campus rent is typically $800-2000+/month more", "level": "moderate"},
+            {"text": "Finding housing later may involve fewer options", "level": "minor"},
+        ],
+        "totalCost": "$18,000+",
+        "costPeriod": "per year",
+    },
+    "college_app": {
+        "title": "College Application",
+        "tradeoffs": [
+            {"text": "Most applications cannot be submitted after the deadline", "level": "notable"},
+            {"text": "Application fee ($50-90) is not recoverable if incomplete", "level": "minor"},
+            {"text": "Later options tend to be limited to open-admission schools", "level": "moderate"},
+            {"text": "A gap year delays career start — average starting salary is ~$45K", "level": "moderate"},
+        ],
+        "totalCost": "$45,000+",
+        "costPeriod": "in delayed earnings",
+    },
+    "scholarship": {
+        "title": "Scholarship Application",
+        "tradeoffs": [
+            {"text": "Awards range from $1,000 to $50,000+ depending on the program", "level": "notable"},
+            {"text": "Without scholarships, more may need to come from loans", "level": "moderate"},
+            {"text": "Most scholarship windows are one-time — reapplication is rare", "level": "minor"},
+        ],
+        "totalCost": "$5,000+",
+        "costPeriod": "average missed award",
+    },
+    "registration": {
+        "title": "Course Registration",
+        "tradeoffs": [
+            {"text": "Popular courses fill up — this can delay graduation timelines", "level": "notable"},
+            {"text": "Later registration often means less ideal schedules", "level": "minor"},
+            {"text": "An extra semester typically costs $15,000+", "level": "moderate"},
+        ],
+        "totalCost": "$15,000+",
+        "costPeriod": "per extra semester",
+    },
+}
+
+class ConsequenceRequest(BaseModel):
+    title: str
+    deadline: Optional[str] = None
+    category: Optional[str] = "general"
+
+@app.post("/api/consequences/analyze")
+async def analyze_consequences(req: ConsequenceRequest):
+    """Analyze tradeoffs of not completing an item"""
+    try:
+        title_lower = req.title.lower()
+
+        # Match to tradeoff data
+        for key, data in TRADEOFFS_DB.items():
+            if key in title_lower or any(word in title_lower for word in key.split("_")):
+                return {"consequences": data["tradeoffs"], "totalCost": data["totalCost"], "costPeriod": data["costPeriod"], "title": data["title"], "source": "database"}
+
+        # Generic tradeoffs for unrecognized items
+        return {
+            "consequences": [
+                {"text": f"If '{req.title}' doesn't happen, it may affect your academic standing", "level": "moderate"},
+                {"text": "Late submissions sometimes incur penalties or are not accepted", "level": "minor"},
+                {"text": "This may affect other items that depend on it", "level": "minor"},
+            ],
+            "totalCost": "Varies",
+            "costPeriod": "depending on the item",
+            "title": req.title,
+            "source": "ai_generated"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== SCHOLARSHIP MATCHING ====================
+
+SCHOLARSHIP_DB = [
+    {"name": "Gates Millennium Scholars", "amount": 25000, "deadline": "2026-02-15", "match_criteria": ["gpa_3.3", "pell_eligible", "us_citizen"], "category": "need-based"},
+    {"name": "National Merit Scholarship", "amount": 2500, "deadline": "2026-03-01", "match_criteria": ["psat_1400", "top_1_percent"], "category": "merit-based"},
+    {"name": "Texas Grant Program", "amount": 10000, "deadline": "2026-03-15", "match_criteria": ["texas_resident", "financial_need", "fafsa_completed"], "category": "state-grant"},
+    {"name": "Dell Scholars Program", "amount": 20000, "deadline": "2026-02-01", "match_criteria": ["gpa_2.4", "pell_eligible"], "category": "need-based"},
+    {"name": "Hispanic Scholarship Fund", "amount": 5000, "deadline": "2026-04-01", "match_criteria": ["hispanic", "gpa_3.0", "us_citizen"], "category": "identity-based"},
+]
+
+@app.get("/api/scholarships/matches")
+async def get_scholarship_matches():
+    """Get AI-matched scholarships"""
+    try:
+        now = datetime.now()
+        results = []
+        for s in SCHOLARSHIP_DB:
+            deadline = datetime.fromisoformat(s["deadline"])
+            days_left = (deadline - now).days
+            status = "expired" if days_left < 0 else "urgent" if days_left <= 7 else "eligible"
+            results.append({
+                **s,
+                "days_left": max(days_left, 0),
+                "status": status,
+                "match_score": 85,  # Simplified
+                "amount_formatted": f"${s['amount']:,}",
+            })
+        return {"scholarships": results, "total_potential": sum(s["amount"] for s in SCHOLARSHIP_DB)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== SMART NOTIFICATIONS ====================
+
+@app.get("/api/notifications/smart")
+async def get_smart_notifications():
+    """Get smart, actionable notifications"""
+    try:
+        notifications = []
+        now = datetime.now()
+
+        # Check for items with upcoming dates
+        for ob in manual_obligations_db.values():
+            if ob.get("status") == "completed":
+                continue
+            deadline = ob.get("deadline")
+            if deadline:
+                try:
+                    dl = datetime.fromisoformat(deadline.replace("Z", ""))
+                    days_left = (dl - now).days
+                    if days_left <= 1:
+                        notifications.append({
+                            "type": "timely",
+                            "title": f"{ob.get('summary', ob.get('title', 'Item'))} — {'tomorrow' if days_left == 1 else 'today'}",
+                            "body": "This date is coming up. It may be worth looking at when you have a moment.",
+                            "action": "View",
+                            "obligation_id": ob.get("obligation_id"),
+                        })
+                    elif days_left <= 3:
+                        notifications.append({
+                            "type": "insight",
+                            "title": f"{ob.get('summary', ob.get('title', 'Item'))} — in {days_left} days",
+                            "body": "This is coming up soon. I can help break it into steps if that would help.",
+                            "action": "See Steps",
+                            "obligation_id": ob.get("obligation_id"),
+                        })
+                except:
+                    pass
+
+        return {"notifications": notifications, "unread_count": len(notifications)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== PANIC MODE ====================
+
+class PanicRequest(BaseModel):
+    title: str
+    category: Optional[str] = "general"
+
+@app.post("/api/panic/generate-steps")
+async def generate_panic_steps(req: PanicRequest):
+    """Generate step-by-step breakdown to help focus on an item"""
+    try:
+        title_lower = req.title.lower()
+
+        if "fafsa" in title_lower:
+            steps = [
+                {"task": "Gather tax documents (W-2s, 1099s, tax returns)", "duration": "30 min"},
+                {"task": "Create or retrieve FSA ID at studentaid.gov", "duration": "15 min"},
+                {"task": "Start FAFSA form — enter personal info", "duration": "20 min"},
+                {"task": "Enter financial information from tax docs", "duration": "25 min"},
+                {"task": "Select schools and review", "duration": "10 min"},
+                {"task": "Sign and submit — screenshot confirmation", "duration": "5 min"},
+            ]
+        elif "housing" in title_lower or "deposit" in title_lower:
+            steps = [
+                {"task": "Log in to student housing portal", "duration": "5 min"},
+                {"task": "Review room selection and meal plan", "duration": "10 min"},
+                {"task": "Get credit/debit card ready", "duration": "2 min"},
+                {"task": "Complete payment form", "duration": "10 min"},
+                {"task": "Screenshot confirmation and save receipt", "duration": "3 min"},
+            ]
+        else:
+            steps = [
+                {"task": "Gather all required materials and information", "duration": "15 min"},
+                {"task": "Open the relevant form or portal", "duration": "5 min"},
+                {"task": "Complete primary sections", "duration": "30 min"},
+                {"task": "Review all entries for accuracy", "duration": "10 min"},
+                {"task": "Submit and save confirmation", "duration": "5 min"},
+            ]
+
+        return {"steps": steps, "total_steps": len(steps), "title": req.title}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== BUDDY SYSTEM ====================
+
+buddy_db: Dict[str, List[Dict]] = {}
+
+class BuddyInvite(BaseModel):
+    user_email: str
+    buddy_email: str
+    obligation_id: Optional[str] = None
+
+@app.post("/api/buddies/invite")
+async def invite_buddy(invite: BuddyInvite):
+    """Invite an accountability buddy"""
+    try:
+        if invite.user_email not in buddy_db:
+            buddy_db[invite.user_email] = []
+
+        buddy = {
+            "email": invite.buddy_email,
+            "status": "pending",
+            "invited_at": datetime.now().isoformat(),
+            "obligation_id": invite.obligation_id,
+            "tasks_helped": 0,
+        }
+        buddy_db[invite.user_email].append(buddy)
+
+        return {"success": True, "message": f"Invitation sent to {invite.buddy_email}", "buddy": buddy}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/buddies/{user_email}")
+async def get_buddies(user_email: str):
+    """Get all buddies for a user"""
+    return {"buddies": buddy_db.get(user_email, []), "count": len(buddy_db.get(user_email, []))}
+
+
+# ==================== AUTOFILL VAULT ====================
+
+vault_db: Dict[str, Dict] = {}
+
+class VaultUpdate(BaseModel):
+    category: str
+    field_key: str
+    value: str
+
+@app.post("/api/vault/update")
+async def update_vault_field(update: VaultUpdate):
+    """Update a field in the auto-fill vault"""
+    try:
+        if update.category not in vault_db:
+            vault_db[update.category] = {}
+        vault_db[update.category][update.field_key] = {
+            "value": update.value,
+            "updated_at": datetime.now().isoformat(),
+        }
+        return {"success": True, "category": update.category, "field": update.field_key}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/vault/data")
+async def get_vault_data():
+    """Get all vault data"""
+    return {"vault": vault_db, "field_count": sum(len(v) for v in vault_db.values())}
+
+
+# ==================== DAILY COACH LOOP ====================
+
+class CheckInRequest(BaseModel):
+    user_id: str
+    free_text: str
+
+class DailyEntry(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    user_id: str
+    free_text: str
+    date: str
+    created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
+
+class CoachBrief(BaseModel):
+    """Internal brief - user never sees this. Stored as structured markdown."""
+    entry_id: str
+    generated_summary: str = ""
+
+class CoachResponseModel(BaseModel):
+    entry_id: str
+    what_stands_out: str
+    why_it_matters: str
+    todays_anchor: str
+    date: str
+
+class EveningSignalRequest(BaseModel):
+    entry_id: str
+    response: str
+
+class EveningSignal(BaseModel):
+    entry_id: str
+    response: str
+    date: str
+
+# In-memory storage for Daily Coach Loop
+daily_entries_db: Dict[str, DailyEntry] = {}
+coach_briefs_db: Dict[str, CoachBrief] = {}
+coach_responses_db: Dict[str, CoachResponseModel] = {}
+evening_signals_db: Dict[str, EveningSignal] = {}
+
+
+def generate_coach_brief_and_response(entry: DailyEntry) -> CoachResponseModel:
+    """Two-step AI: generate internal brief, then structured coach response."""
+    api_key = os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY")
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY not set")
+    client = Anthropic(api_key=api_key)
+
+    # Step 1: Internal brief (structured, user never sees this)
+    brief_prompt = f"""# Task: Generate Coach Brief
+
+Below is a user's daily check-in. Analyze it and produce a structured Coach Brief
+for a human coach.
+
+## User Check-In
+{entry.free_text}
+
+---
+
+## Output Format (Strict)
+
+### A. Domains Detected
+List the primary domains involved.
+Examples: Legal, School, Work, Money, Ideas, Personal Admin, Health.
+Use short bullet points.
+
+### B. Time Sensitivity
+Classify items as:
+- Urgent (today)
+- Time-sensitive (this week)
+- Open-ended
+
+Explain briefly why.
+
+### C. Avoidance or Drift Signals
+Note any signs of:
+- Repeated unresolved items
+- Vague phrasing
+- Emotional hedging
+- Cognitive overload
+
+Be neutral and specific.
+If none detected, state "None detected."
+
+### D. Leverage Assessment
+Identify:
+- Low-effort / high-relief items
+- High-effort / high-impact items
+- Likely noise
+
+Do not recommend action.
+Just label.
+
+### E. Coach Summary (5-7 lines max)
+Write a compressed summary a coach can read in under 30 seconds.
+Highlight:
+- What stands out most
+- Why it matters
+- What reducing uncertainty would help most today
+
+Do NOT:
+- Address the user directly
+- Give advice
+- Suggest a priority
+
+This brief exists to support human judgment, not replace it."""
+
+    brief_message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=2048,
+        messages=[{"role": "user", "content": brief_prompt}]
+    )
+
+    brief_text = brief_message.content[0].text.strip()
+    brief = CoachBrief(entry_id=entry.id, generated_summary=brief_text)
+    coach_briefs_db[entry.id] = brief
+
+    # Step 2: Coach response (user-facing, structured)
+    response_prompt = f"""# Task: Draft Coach Response (For Human Review)
+
+Using the Coach Brief below, draft a single coach message.
+
+The tone must be:
+- Calm
+- Direct
+- Non-motivational
+- Non-therapeutic
+
+## Coach Brief
+{brief_text}
+
+---
+
+## Response Structure (Required)
+
+Return ONLY valid JSON with exactly three fields:
+{{
+  "what_stands_out": "One sentence naming the focal issue.",
+  "why_it_matters": "One or two sentences explaining consequence or leverage.",
+  "todays_anchor": "One clear attention anchor for today."
+}}
+
+Rules:
+- No emojis
+- No encouragement
+- No multiple tasks
+- No questions
+- No soft language
+
+This draft will be reviewed by a human coach before being sent."""
+
+    response_message = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": response_prompt}]
+    )
+
+    response_text = response_message.content[0].text.strip()
+    if response_text.startswith("```"):
+        response_text = response_text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    response_data = json.loads(response_text)
+    coach_response = CoachResponseModel(
+        entry_id=entry.id,
+        date=entry.date,
+        **response_data
+    )
+    coach_responses_db[entry.id] = coach_response
+    return coach_response
+
+
+@app.post("/api/coach/check-in")
+async def submit_check_in(request: CheckInRequest):
+    """Submit morning check-in. Triggers brief generation and coach response."""
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        existing = [e for e in daily_entries_db.values()
+                    if e.user_id == request.user_id and e.date == today]
+        if existing:
+            entry = existing[0]
+            if entry.id in coach_responses_db:
+                return {
+                    "entry_id": entry.id,
+                    "status": "already_submitted",
+                    "response": coach_responses_db[entry.id].dict()
+                }
+            return {"entry_id": entry.id, "status": "processing"}
+
+        entry = DailyEntry(
+            user_id=request.user_id,
+            free_text=request.free_text,
+            date=today
+        )
+        daily_entries_db[entry.id] = entry
+
+        try:
+            coach_response = generate_coach_brief_and_response(entry)
+            return {
+                "entry_id": entry.id,
+                "status": "complete",
+                "response": coach_response.dict()
+            }
+        except Exception as e:
+            logger.error(f"Error generating coach response: {e}")
+            fallback = CoachResponseModel(
+                entry_id=entry.id,
+                what_stands_out="I wasn't able to process your check-in fully. Try again in a moment.",
+                why_it_matters="Technical difficulties happen. Your check-in is saved.",
+                todays_anchor="Start with whatever feels most time-sensitive from what you wrote.",
+                date=today
+            )
+            coach_responses_db[entry.id] = fallback
+            return {
+                "entry_id": entry.id,
+                "status": "complete",
+                "response": fallback.dict()
+            }
+    except Exception as e:
+        logger.error(f"Check-in error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/coach/today")
+async def get_today_status(user_id: str):
+    """Get the full state for today: entry, response, evening signal."""
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    entries = [e for e in daily_entries_db.values()
+               if e.user_id == user_id and e.date == today]
+
+    if not entries:
+        return {"status": "no_entry", "entry": None, "response": None, "evening_signal": None}
+
+    entry = entries[0]
+    response = coach_responses_db.get(entry.id)
+    evening = evening_signals_db.get(entry.id)
+
+    return {
+        "status": "complete" if response else "processing",
+        "entry": entry.dict(),
+        "response": response.dict() if response else None,
+        "evening_signal": evening.dict() if evening else None
+    }
+
+
+@app.post("/api/coach/evening-signal")
+async def submit_evening_signal(request: EveningSignalRequest):
+    """Submit the evening reflection signal."""
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        if request.entry_id not in daily_entries_db:
+            raise HTTPException(status_code=404, detail="Entry not found")
+
+        signal = EveningSignal(
+            entry_id=request.entry_id,
+            response=request.response,
+            date=today
+        )
+        evening_signals_db[request.entry_id] = signal
+        logger.info(f"Evening signal recorded: {request.response} for entry {request.entry_id}")
+        return {"status": "recorded", "signal": signal.dict()}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Evening signal error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== EMAIL MONITORING ENDPOINTS ====================
+
+class EmailScanRequest(BaseModel):
+    user_id: str
+
+class EmailConnectionRequest(BaseModel):
+    user_id: str
+    access_token: str
+    refresh_token: Optional[str] = None
+    email_address: Optional[str] = None
+
+class EmailDismissRequest(BaseModel):
+    user_id: str
+    email_id: str
+
+
+@app.post("/api/email/connect")
+async def connect_email(request: EmailConnectionRequest):
+    """Store a user's Gmail OAuth tokens in Supabase for monitoring."""
+    try:
+        from backend.email_monitor import EmailMonitor
+        monitor = EmailMonitor()
+
+        # Upsert connection
+        monitor.supabase.table("email_connections").upsert({
+            "user_id": request.user_id,
+            "provider": "gmail",
+            "access_token": request.access_token,
+            "refresh_token": request.refresh_token,
+            "email_address": request.email_address,
+            "is_active": True,
+        }, on_conflict="user_id").execute()
+
+        return {"status": "connected", "provider": "gmail"}
+    except Exception as e:
+        logger.error(f"Email connect error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/email/scan")
+async def scan_emails(request: EmailScanRequest):
+    """Trigger a manual email scan for a user. Fetches Gmail, analyzes with AI, stores in Supabase."""
+    try:
+        from backend.email_monitor import EmailMonitor
+        monitor = EmailMonitor()
+
+        # Get user's email connection
+        connection = monitor.get_user_connection(request.user_id)
+        if not connection:
+            raise HTTPException(status_code=404, detail="No email connection found. Connect Gmail first.")
+
+        # Get user's school names for context
+        schools_result = monitor.supabase.table("schools") \
+            .select("name") \
+            .eq("user_id", request.user_id) \
+            .execute()
+        school_names = [s["name"] for s in (schools_result.data or [])]
+
+        # Run the scan
+        results = monitor.scan_user_emails(
+            user_id=request.user_id,
+            access_token=connection["access_token"],
+            refresh_token=connection.get("refresh_token"),
+            school_names=school_names,
+        )
+
+        return {"status": "complete", **results}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Email scan error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/email/history")
+async def get_email_history(user_id: str, limit: int = 50, actionable_only: bool = False):
+    """Get analyzed email history for a user from Supabase."""
+    try:
+        from backend.email_monitor import EmailMonitor
+        monitor = EmailMonitor()
+
+        query = monitor.supabase.table("analyzed_emails") \
+            .select("*") \
+            .eq("user_id", user_id) \
+            .eq("is_dismissed", False) \
+            .order("created_at", desc=True) \
+            .limit(limit)
+
+        if actionable_only:
+            query = query.eq("requires_action", True)
+
+        result = query.execute()
+        return {"emails": result.data or [], "count": len(result.data or [])}
+    except Exception as e:
+        logger.error(f"Email history error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/email/dismiss")
+async def dismiss_email(request: EmailDismissRequest):
+    """Dismiss an analyzed email so it no longer appears in the feed."""
+    try:
+        from backend.email_monitor import EmailMonitor
+        monitor = EmailMonitor()
+
+        monitor.supabase.table("analyzed_emails") \
+            .update({"is_dismissed": True}) \
+            .eq("id", request.email_id) \
+            .eq("user_id", request.user_id) \
+            .execute()
+
+        return {"status": "dismissed"}
+    except Exception as e:
+        logger.error(f"Email dismiss error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/email/connection")
+async def get_email_connection(user_id: str):
+    """Check if a user has an active email connection."""
+    try:
+        from backend.email_monitor import EmailMonitor
+        monitor = EmailMonitor()
+        connection = monitor.get_user_connection(user_id)
+        if connection:
+            return {
+                "connected": True,
+                "provider": connection["provider"],
+                "email": connection.get("email_address"),
+                "last_scan": connection.get("last_scan_at"),
+            }
+        return {"connected": False}
+    except Exception as e:
+        logger.error(f"Email connection check error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== EMAIL DRAFTING & APPROVAL ENDPOINTS ====================
+
+class DraftEmailRequest(BaseModel):
+    user_id: str
+    school_id: str
+    document_id: Optional[str] = None
+    draft_type: str = "follow_up"  # "follow_up" | "status_inquiry"
+    inquiry_type: Optional[str] = "general"  # "general" | "timeline" | "missing_documents"
+
+class ImproveDraftRequest(BaseModel):
+    user_id: str
+    follow_up_id: str
+    feedback: str
+
+class SendEmailRequest(BaseModel):
+    user_id: str
+    follow_up_id: str
+    edited_content: Optional[str] = None
+    edited_subject: Optional[str] = None
+
+class CancelDraftRequest(BaseModel):
+    user_id: str
+    follow_up_id: str
+
+
+@app.post("/api/draft/create")
+async def create_draft(request: DraftEmailRequest):
+    """Generate an AI email draft and store it as a pending follow-up in Supabase."""
+    try:
+        from backend.email_drafter import draft_follow_up_email, draft_status_inquiry_email
+        from backend.email_monitor import _get_supabase
+
+        sb = _get_supabase()
+
+        # Get school info
+        school_result = sb.table("schools").select("*").eq("id", request.school_id).single().execute()
+        school = school_result.data
+        if not school:
+            raise HTTPException(status_code=404, detail="School not found")
+
+        # Get user profile
+        profile_result = sb.table("profiles").select("*").eq("id", request.user_id).single().execute()
+        profile = profile_result.data or {}
+        student_name = profile.get("full_name") or profile.get("email", "Student")
+        student_email = profile.get("email", "")
+
+        document_name = None
+        deadline = None
+        if request.document_id:
+            doc_result = sb.table("documents").select("*").eq("id", request.document_id).single().execute()
+            if doc_result.data:
+                document_name = doc_result.data["name"]
+                deadline = doc_result.data.get("deadline")
+
+        # Draft the email
+        if request.draft_type == "follow_up" and document_name:
+            result = draft_follow_up_email(
+                school_name=school["name"],
+                document_name=document_name,
+                deadline=deadline,
+                student_name=student_name,
+            )
+        else:
+            result = draft_status_inquiry_email(
+                school_name=school["name"],
+                student_name=student_name,
+                student_email=student_email,
+                inquiry_type=request.inquiry_type or "general",
+            )
+
+        subject = result.get("subject", f"Re: {school['name']} Financial Aid")
+        body = result.get("body", "")
+
+        # Store in follow_ups table
+        follow_up = sb.table("follow_ups").insert({
+            "user_id": request.user_id,
+            "school_id": request.school_id,
+            "document_id": request.document_id,
+            "follow_up_type": request.draft_type,
+            "status": "pending_approval",
+            "drafted_content": body,
+            "subject": subject,
+            "recipient_email": school.get("notes", ""),  # TODO: store fin-aid email in school record
+            "metadata": {
+                "school_name": school["name"],
+                "document_name": document_name,
+                "student_name": student_name,
+            },
+        }).execute()
+
+        return {"status": "drafted", "follow_up": follow_up.data[0] if follow_up.data else None}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Draft create error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/draft/improve")
+async def improve_draft_endpoint(request: ImproveDraftRequest):
+    """Improve an existing draft based on user feedback using Claude."""
+    try:
+        from backend.email_drafter import improve_draft
+        from backend.email_monitor import _get_supabase
+
+        sb = _get_supabase()
+
+        # Get original draft
+        result = sb.table("follow_ups").select("*").eq("id", request.follow_up_id).eq("user_id", request.user_id).single().execute()
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Draft not found")
+
+        original = result.data["edited_content"] or result.data["drafted_content"]
+        improved = improve_draft(original, request.feedback)
+
+        # Update
+        sb.table("follow_ups").update({
+            "edited_content": improved,
+        }).eq("id", request.follow_up_id).execute()
+
+        return {"status": "improved", "content": improved}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Draft improve error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/draft/send")
+async def send_draft(request: SendEmailRequest):
+    """Approve and send a draft email via Gmail."""
+    try:
+        from backend.email_sender import EmailSender
+        from backend.email_monitor import _get_supabase
+
+        sb = _get_supabase()
+
+        # Ensure the user has a connected Gmail account.
+        conn_result = (
+            sb.table("email_connections")
+            .select("*")
+            .eq("user_id", request.user_id)
+            .eq("is_active", True)
+            .single()
+            .execute()
+        )
+        connection = conn_result.data
+        if not connection:
+            raise HTTPException(status_code=400, detail="Gmail not connected. Connect Gmail first.")
+
+        # Get the follow-up
+        result = sb.table("follow_ups").select("*").eq("id", request.follow_up_id).eq("user_id", request.user_id).single().execute()
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Draft not found")
+
+        follow_up = result.data
+        final_content = request.edited_content or follow_up.get("edited_content") or follow_up["drafted_content"]
+        final_subject = request.edited_subject or follow_up.get("subject", "Financial Aid Inquiry")
+        recipient = follow_up.get("recipient_email", "")
+
+        if not recipient:
+            raise HTTPException(status_code=400, detail="No recipient email. Set it before sending.")
+
+        # Send via Gmail
+        sender = EmailSender(
+            access_token=connection["access_token"],
+            refresh_token=connection.get("refresh_token"),
+            token_expiry=connection.get("token_expiry"),
+        )
+        message_id = sender.send_email(
+            to=recipient,
+            subject=final_subject,
+            body=final_content,
+        )
+
+        # Persist refreshed access token/expiry if the sender refreshed it.
+        try:
+            sb.table("email_connections").update(
+                {
+                    "access_token": sender.access_token,
+                    "token_expiry": sender.token_expiry,
+                }
+            ).eq("user_id", request.user_id).execute()
+        except Exception:
+            # Non-fatal; email was sent.
+            pass
+
+        # Update status
+        sb.table("follow_ups").update({
+            "status": "sent",
+            "edited_content": final_content,
+            "subject": final_subject,
+            "sent_at": datetime.now().isoformat(),
+            "sent_message_id": message_id,
+        }).eq("id", request.follow_up_id).execute()
+
+        return {"status": "sent", "message_id": message_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Draft send error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/draft/cancel")
+async def cancel_draft(request: CancelDraftRequest):
+    """Cancel a pending draft."""
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+        sb.table("follow_ups").update({"status": "cancelled"}).eq("id", request.follow_up_id).eq("user_id", request.user_id).execute()
+        return {"status": "cancelled"}
+    except Exception as e:
+        logger.error(f"Draft cancel error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/draft/pending")
+async def get_pending_drafts(user_id: str):
+    """Get all pending-approval drafts for a user."""
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+        result = sb.table("follow_ups").select("*").eq("user_id", user_id).eq("status", "pending_approval").order("created_at", desc=True).execute()
+        return {"drafts": result.data or [], "count": len(result.data or [])}
+    except Exception as e:
+        logger.error(f"Pending drafts error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/draft/history")
+async def get_draft_history(user_id: str):
+    """Get all follow-ups (all statuses) for a user."""
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+        result = sb.table("follow_ups").select("*").eq("user_id", user_id).order("created_at", desc=True).limit(50).execute()
+        return {"drafts": result.data or [], "count": len(result.data or [])}
+    except Exception as e:
+        logger.error(f"Draft history error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== BACKGROUND JOBS (OPTIONAL) ====================
+
+def _scan_all_connected_users():
+    """
+    Optional background email scan loop.
+
+    Enable by setting EMAIL_SCAN_INTERVAL_MINUTES > 0 in the environment.
+    This keeps MVP simple (single service) while still supporting "email found within ~15 min".
+    """
+    try:
+        from backend.email_monitor import EmailMonitor
+
+        monitor = EmailMonitor()
+        connections = (
+            monitor.supabase.table("email_connections")
+            .select("user_id, access_token, refresh_token")
+            .eq("is_active", True)
+            .execute()
+        )
+        rows = connections.data or []
+        if not rows:
+            return
+
+        for conn in rows:
+            user_id = conn.get("user_id")
+            access_token = conn.get("access_token")
+            refresh_token = conn.get("refresh_token")
+            if not user_id or not access_token:
+                continue
+
+            try:
+                schools_result = (
+                    monitor.supabase.table("schools")
+                    .select("name")
+                    .eq("user_id", user_id)
+                    .execute()
+                )
+                school_names = [s.get("name") for s in (schools_result.data or []) if s.get("name")]
+
+                monitor.scan_user_emails(
+                    user_id=user_id,
+                    access_token=access_token,
+                    refresh_token=refresh_token,
+                    school_names=school_names,
+                    max_results=30,
+                )
+            except Exception as e:
+                logger.error("Scheduled scan failed for user %s: %s", user_id, e)
+    except Exception as e:
+        logger.error("Scheduled scan loop error: %s", e)
+
+
+@app.on_event("startup")
+def _startup_jobs():
+    interval = int(os.getenv("EMAIL_SCAN_INTERVAL_MINUTES", "0") or "0")
+    if interval <= 0:
+        return
+    try:
+        scheduler.add_job(
+            _scan_all_connected_users,
+            "interval",
+            minutes=interval,
+            id="email_scan_all",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+        )
+        scheduler.start()
+        logger.info("Background email scan enabled: every %s minutes", interval)
+    except Exception as e:
+        logger.error("Failed to start background jobs: %s", e)
+
+
+@app.on_event("shutdown")
+def _shutdown_jobs():
+    try:
+        scheduler.shutdown(wait=False)
+    except Exception:
+        pass
+
+
+# ==================== STARTUP ====================
+
+if __name__ == "__main__":
+    logger.info("Starting Obligo API server...")
+    logger.info("Daily Coach Loop endpoints:")
+    logger.info("  POST /api/coach/check-in       - Submit morning check-in")
+    logger.info("  GET  /api/coach/today           - Get today's state")
+    logger.info("  POST /api/coach/evening-signal  - Submit evening signal")
+    logger.info("Email Monitoring endpoints:")
+    logger.info("  POST /api/email/connect         - Store Gmail OAuth tokens")
+    logger.info("  POST /api/email/scan            - Trigger email scan")
+    logger.info("  GET  /api/email/history          - Get analyzed emails")
+    logger.info("  POST /api/email/dismiss          - Dismiss an email")
+    logger.info("  GET  /api/email/connection       - Check connection status")
+    logger.info("Email Drafting endpoints:")
+    logger.info("  POST /api/draft/create           - Generate AI email draft")
+    logger.info("  POST /api/draft/improve          - Improve draft with feedback")
+    logger.info("  POST /api/draft/send             - Approve & send draft")
+    logger.info("  POST /api/draft/cancel           - Cancel a draft")
+    logger.info("  GET  /api/draft/pending          - Get pending approvals")
+    logger.info("  GET  /api/draft/history          - Get all drafts")
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+    

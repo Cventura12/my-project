@@ -1,0 +1,39 @@
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+credentials.json
+token.json
+outlook_credentials.json
+*.pem
+
+# Logs
+*.log
+action_log.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node / Next / Vite
+node_modules/
+.next/
+dist/
+.turbo/
+.vercel/
+
+# Misc
+nul
