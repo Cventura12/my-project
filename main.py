@@ -4020,6 +4020,574 @@ async def get_obligation_overrides(obligation_id: str, user_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== PHASE 2 STEP 4: STUCK DETECTION ====================
+#
+# WHAT "STUCK" MEANS:
+# An obligation is STUCK when:
+#   1. status = pending OR blocked
+#   2. All forward paths are blocked (deps unmet, proof missing, deadline passed)
+#   3. No status change has occurred in STALE_DAYS
+#
+# This is NOT inactivity. This is structural immobility.
+#
+# STUCK DETECTION IS DETERMINISTIC:
+# No AI. No predictions. Just state checks and arithmetic.
+#
+# GUARDRAILS:
+# - No auto-un-sticking. Only a real status change clears stuck.
+# - No auto-overrides. Stuck detection NEVER resolves blocks.
+# - No AI explanations. Only factual state descriptions.
+# - No "tips" or "suggestions." Only "this is why nothing is moving."
+
+STALE_DAYS = 5  # Conservative default. An obligation with no status change for 5+ days is stale.
+
+# Stuck reason taxonomy. Exact list. Do NOT invent new categories.
+_STUCK_REASONS = {
+    "unmet_dependency",
+    "overridden_dependency",
+    "missing_proof",
+    "external_verification_pending",
+    "hard_deadline_passed",
+}
+
+
+# ==================== PHASE 3 STEP 1: SEVERITY ====================
+#
+# Deterministic severity computation. No AI. No predictions.
+# Mirrors the logic in obligo-next/src/lib/severity.ts exactly.
+#
+# Severity is computed server-side alongside stuck detection and persisted.
+# The frontend also computes severity client-side for immediate display.
+# Both MUST produce the same result from the same inputs.
+#
+# FIVE LEVELS: normal, elevated, high, critical, failed. No others.
+# DEFAULT BIAS: Understate early, overstate late.
+
+SEVERITY_HIGH_DAYS = 3
+SEVERITY_STUCK_HIGH_DAYS = 7
+SEVERITY_ELEVATED_DAYS = 14
+
+_SEVERITY_LEVELS = {"normal", "elevated", "high", "critical", "failed"}
+_SEVERITY_REASONS = {
+    "verified", "deadline_passed", "stuck_deadline_imminent",
+    "deadline_imminent", "stuck_deadline_approaching",
+    "deadline_approaching", "stuck_no_deadline_pressure", "no_pressure",
+}
+
+
+def _compute_severity(
+    status: str,
+    deadline: Optional[str],
+    stuck: bool,
+    now: datetime,
+) -> tuple[str, str]:
+    """
+    Compute (severity_level, severity_reason) for an obligation.
+
+    Pure function. No side effects. No network calls.
+    Rules match severity.ts exactly.
+    """
+    # Rule 1: Verified = done
+    if status == "verified":
+        return ("normal", "verified")
+
+    # Time computation
+    if deadline:
+        try:
+            deadline_dt = datetime.fromisoformat(deadline.replace("Z", "+00:00")).replace(tzinfo=None)
+        except (ValueError, AttributeError):
+            deadline_dt = None
+
+        if deadline_dt:
+            days_remaining = (deadline_dt - now).total_seconds() / (60 * 60 * 24)
+
+            # Rule 2: Deadline passed → Failed
+            if days_remaining < 0:
+                return ("failed", "deadline_passed")
+
+            # Rule 3: Deadline <= 3 days AND stuck → Critical
+            if days_remaining <= SEVERITY_HIGH_DAYS and stuck:
+                return ("critical", "stuck_deadline_imminent")
+
+            # Rule 4: Deadline <= 3 days → High
+            if days_remaining <= SEVERITY_HIGH_DAYS:
+                return ("high", "deadline_imminent")
+
+            # Rule 5: Stuck AND deadline <= 7 days → High
+            if stuck and days_remaining <= SEVERITY_STUCK_HIGH_DAYS:
+                return ("high", "stuck_deadline_approaching")
+
+            # Rule 6: Deadline <= 14 days → Elevated
+            if days_remaining <= SEVERITY_ELEVATED_DAYS:
+                return ("elevated", "deadline_approaching")
+
+    # Rule 7: Stuck with no deadline pressure → Elevated
+    if stuck:
+        return ("elevated", "stuck_no_deadline_pressure")
+
+    # Rule 8: Everything else → Normal
+    return ("normal", "no_pressure")
+
+
+def _find_deadlocked_obligations(
+    dep_edges: list[tuple[str, str]],
+    override_set: set[tuple[str, str]],
+) -> set[str]:
+    """
+    Find obligation IDs that are part of or downstream of dependency cycles.
+
+    A cycle (A → B → A) means neither A nor B can ever be verified.
+    An obligation downstream of a cycle (C → A where A is in a cycle) is also deadlocked.
+
+    Overridden edges are excluded — an override breaks the cycle from that direction.
+
+    Uses DFS with recursion stack to detect back edges.
+    """
+    # Build graph excluding overridden edges
+    graph: dict[str, set[str]] = {}
+    all_nodes: set[str] = set()
+    for obl_id, dep_id in dep_edges:
+        if (obl_id, dep_id) in override_set:
+            continue
+        graph.setdefault(obl_id, set()).add(dep_id)
+        all_nodes.add(obl_id)
+        all_nodes.add(dep_id)
+
+    deadlocked: set[str] = set()
+    visited: set[str] = set()
+    in_stack: set[str] = set()
+
+    def dfs(node: str) -> bool:
+        """Returns True if node reaches a cycle."""
+        visited.add(node)
+        in_stack.add(node)
+        reaches_cycle = False
+        for dep in graph.get(node, set()):
+            if dep in in_stack:
+                # Back edge → cycle detected
+                deadlocked.add(dep)
+                deadlocked.add(node)
+                reaches_cycle = True
+            elif dep not in visited:
+                if dfs(dep):
+                    deadlocked.add(node)
+                    reaches_cycle = True
+            elif dep in deadlocked:
+                deadlocked.add(node)
+                reaches_cycle = True
+        in_stack.discard(node)
+        return reaches_cycle
+
+    for node in all_nodes:
+        if node not in visited:
+            dfs(node)
+
+    return deadlocked
+
+
+def _trace_dependency_chain(
+    obl_id: str,
+    dep_graph: dict[str, list[str]],
+    override_set: set[tuple[str, str]],
+    obl_by_id: dict[str, dict],
+    max_depth: int = 10,
+) -> list[dict]:
+    """
+    Trace the dependency chain from an obligation to its root blocker.
+
+    Follows the first unmet (non-overridden) dependency at each level.
+    Returns a list of chain links with type, title, status, and cycle detection.
+    """
+    chain: list[dict] = []
+    current = obl_id
+    seen: set[str] = set()
+
+    while current and current not in seen and len(chain) < max_depth:
+        seen.add(current)
+        deps = dep_graph.get(current, [])
+        unmet = None
+        for dep_id in deps:
+            if (current, dep_id) in override_set:
+                continue
+            dep_obl = obl_by_id.get(dep_id)
+            if dep_obl and dep_obl["status"] != "verified":
+                unmet = dep_id
+                break
+
+        if unmet:
+            dep_obl = obl_by_id[unmet]
+            is_cycle = unmet in seen
+            chain.append({
+                "obligation_id": unmet,
+                "type": dep_obl["type"],
+                "title": dep_obl["title"],
+                "status": dep_obl["status"],
+                "is_cycle_back": is_cycle,
+            })
+            if is_cycle:
+                break
+            current = unmet
+        else:
+            break
+
+    return chain
+
+
+@app.get("/api/obligations/stuck-detection")
+async def detect_stuck_obligations(user_id: str):
+    """
+    Evaluate stuck state for all obligations belonging to a user.
+
+    For each obligation:
+    1. Check if status is pending/blocked (precondition for stuck)
+    2. Check if stale (no status change in STALE_DAYS)
+    3. Classify the dominant blocking reason
+    4. Detect dependency deadlocks (cycles)
+    5. Trace the dependency chain
+    6. Persist stuck state to the database
+    7. Return results
+
+    This endpoint is DETERMINISTIC. No AI. No suggestions.
+    It tells the user "nothing is happening, and this is why."
+    """
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        # Fetch all obligations for this user
+        obl_res = sb.table("obligations") \
+            .select("*") \
+            .eq("user_id", user_id) \
+            .execute()
+        all_obligations = obl_res.data or []
+
+        if not all_obligations:
+            return {"obligations": [], "deadlocks_detected": 0}
+
+        obl_ids = [o["id"] for o in all_obligations]
+        obl_by_id = {o["id"]: o for o in all_obligations}
+
+        # Fetch all dependency edges
+        deps_res = sb.table("obligation_dependencies") \
+            .select("obligation_id, depends_on_obligation_id") \
+            .in_("obligation_id", obl_ids) \
+            .execute()
+        dep_edges = [
+            (d["obligation_id"], d["depends_on_obligation_id"])
+            for d in (deps_res.data or [])
+        ]
+
+        # Build dependency graph: obligation_id -> [dependency_ids]
+        dep_graph: dict[str, list[str]] = {}
+        for obl_id, dep_id in dep_edges:
+            dep_graph.setdefault(obl_id, []).append(dep_id)
+
+        # Fetch all overrides
+        overrides_res = sb.table("obligation_overrides") \
+            .select("obligation_id, overridden_dependency_id") \
+            .in_("obligation_id", obl_ids) \
+            .execute()
+        override_set: set[tuple[str, str]] = {
+            (o["obligation_id"], o["overridden_dependency_id"])
+            for o in (overrides_res.data or [])
+        }
+
+        # Fetch proof counts per obligation (for missing_proof detection)
+        proofs_res = sb.table("obligation_proofs") \
+            .select("obligation_id") \
+            .in_("obligation_id", obl_ids) \
+            .execute()
+        proof_obl_ids: set[str] = {p["obligation_id"] for p in (proofs_res.data or [])}
+
+        # Detect deadlocked obligations (cycles in dependency graph)
+        deadlocked_ids = _find_deadlocked_obligations(dep_edges, override_set)
+
+        now = datetime.utcnow()
+        results = []
+        updates_to_persist: list[dict] = []
+
+        for obl in all_obligations:
+            obl_id = obl["id"]
+            status = obl["status"]
+
+            # Precondition: only pending/blocked can be stuck
+            if status in ("verified", "submitted"):
+                # submitted is handled separately as external_verification_pending
+                if status == "submitted":
+                    # Check stale for submitted obligations
+                    status_changed = obl.get("status_changed_at") or obl.get("updated_at") or obl["created_at"]
+                    try:
+                        changed_dt = datetime.fromisoformat(status_changed.replace("Z", "+00:00")).replace(tzinfo=None)
+                    except (ValueError, AttributeError):
+                        changed_dt = now
+                    days_since = (now - changed_dt).days
+
+                    if days_since >= STALE_DAYS:
+                        stuck_reason = "external_verification_pending"
+                        stuck_since = obl.get("stuck_since")
+                        if not obl.get("stuck"):
+                            stuck_since = now.isoformat()
+
+                        chain = _trace_dependency_chain(obl_id, dep_graph, override_set, obl_by_id)
+
+                        # Phase 3 Step 1: Compute severity
+                        sev_level, sev_reason = _compute_severity(status, obl.get("deadline"), True, now)
+                        sev_since = obl.get("severity_since")
+                        if obl.get("severity") != sev_level:
+                            sev_since = now.isoformat()
+
+                        results.append({
+                            "obligation_id": obl_id,
+                            "type": obl["type"],
+                            "title": obl["title"],
+                            "status": status,
+                            "stuck": True,
+                            "stuck_reason": stuck_reason,
+                            "stuck_since": stuck_since,
+                            "is_deadlocked": obl_id in deadlocked_ids,
+                            "chain": chain,
+                            "days_stale": days_since,
+                            "severity": sev_level,
+                            "severity_reason": sev_reason,
+                            "severity_since": sev_since,
+                        })
+                        updates_to_persist.append({
+                            "id": obl_id,
+                            "stuck": True,
+                            "stuck_reason": stuck_reason,
+                            "stuck_since": stuck_since,
+                            "severity": sev_level,
+                            "severity_reason": sev_reason,
+                            "severity_since": sev_since,
+                        })
+                    else:
+                        # Phase 3 Step 1: Compute severity (not stuck)
+                        sev_level, sev_reason = _compute_severity(status, obl.get("deadline"), False, now)
+                        sev_since = obl.get("severity_since")
+                        if obl.get("severity") != sev_level:
+                            sev_since = now.isoformat()
+
+                        # Not stale yet — clear stuck if previously set, always persist severity
+                        needs_update = obl.get("stuck") or obl.get("severity") != sev_level
+                        if needs_update:
+                            updates_to_persist.append({
+                                "id": obl_id,
+                                "stuck": False,
+                                "stuck_reason": None,
+                                "stuck_since": None,
+                                "severity": sev_level,
+                                "severity_reason": sev_reason,
+                                "severity_since": sev_since,
+                            })
+                        results.append({
+                            "obligation_id": obl_id,
+                            "type": obl["type"],
+                            "title": obl["title"],
+                            "status": status,
+                            "stuck": False,
+                            "stuck_reason": None,
+                            "stuck_since": None,
+                            "is_deadlocked": False,
+                            "chain": [],
+                            "days_stale": days_since,
+                            "severity": sev_level,
+                            "severity_reason": sev_reason,
+                            "severity_since": sev_since,
+                        })
+                    continue
+
+                # verified — never stuck, severity = normal
+                sev_level, sev_reason = "normal", "verified"
+                sev_since = obl.get("severity_since")
+                if obl.get("severity") != sev_level:
+                    sev_since = now.isoformat()
+
+                needs_update = obl.get("stuck") or obl.get("severity") != sev_level
+                if needs_update:
+                    updates_to_persist.append({
+                        "id": obl_id,
+                        "stuck": False,
+                        "stuck_reason": None,
+                        "stuck_since": None,
+                        "severity": sev_level,
+                        "severity_reason": sev_reason,
+                        "severity_since": sev_since,
+                    })
+                results.append({
+                    "obligation_id": obl_id,
+                    "type": obl["type"],
+                    "title": obl["title"],
+                    "status": status,
+                    "stuck": False,
+                    "stuck_reason": None,
+                    "stuck_since": None,
+                    "is_deadlocked": False,
+                    "chain": [],
+                    "days_stale": 0,
+                    "severity": sev_level,
+                    "severity_reason": sev_reason,
+                    "severity_since": sev_since,
+                })
+                continue
+
+            # status is pending or blocked
+            status_changed = obl.get("status_changed_at") or obl.get("updated_at") or obl["created_at"]
+            try:
+                changed_dt = datetime.fromisoformat(status_changed.replace("Z", "+00:00")).replace(tzinfo=None)
+            except (ValueError, AttributeError):
+                changed_dt = now
+            days_since = (now - changed_dt).days
+
+            # Classify dominant blocking reason (priority order)
+            is_deadlock = obl_id in deadlocked_ids
+            has_unmet_deps = False
+            has_overridden_deps_only = False
+            needs_proof = obl.get("proof_required", False) and obl_id not in proof_obl_ids
+            deadline_passed = False
+
+            if obl.get("deadline"):
+                try:
+                    deadline_dt = datetime.fromisoformat(
+                        obl["deadline"].replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                    deadline_passed = deadline_dt < now
+                except (ValueError, AttributeError):
+                    pass
+
+            # Check dependencies
+            deps = dep_graph.get(obl_id, [])
+            unmet_count = 0
+            overridden_count = 0
+            for dep_id in deps:
+                dep_obl = obl_by_id.get(dep_id)
+                if dep_obl and dep_obl["status"] != "verified":
+                    if (obl_id, dep_id) in override_set:
+                        overridden_count += 1
+                    else:
+                        unmet_count += 1
+
+            has_unmet_deps = unmet_count > 0
+            has_overridden_deps_only = overridden_count > 0 and unmet_count == 0
+
+            # Determine dominant reason (priority: deadlock > deadline > unmet_dep > missing_proof > overridden)
+            stuck_reason: Optional[str] = None
+            is_structurally_blocked = False
+
+            if is_deadlock:
+                stuck_reason = "unmet_dependency"
+                is_structurally_blocked = True
+            elif deadline_passed:
+                stuck_reason = "hard_deadline_passed"
+                is_structurally_blocked = True
+            elif has_unmet_deps:
+                stuck_reason = "unmet_dependency"
+                is_structurally_blocked = True
+            elif needs_proof:
+                stuck_reason = "missing_proof"
+                is_structurally_blocked = True
+            elif has_overridden_deps_only:
+                stuck_reason = "overridden_dependency"
+                is_structurally_blocked = True
+
+            # Stuck requires: structurally blocked AND stale
+            is_stuck = is_structurally_blocked and days_since >= STALE_DAYS
+
+            # Trace the dependency chain for context
+            chain = _trace_dependency_chain(obl_id, dep_graph, override_set, obl_by_id)
+
+            stuck_since = None
+            if is_stuck:
+                stuck_since = obl.get("stuck_since")
+                if not obl.get("stuck"):
+                    # First time detected as stuck — record now
+                    stuck_since = now.isoformat()
+
+            # Phase 3 Step 1: Compute severity
+            sev_level, sev_reason = _compute_severity(status, obl.get("deadline"), is_stuck, now)
+            sev_since = obl.get("severity_since")
+            if obl.get("severity") != sev_level:
+                sev_since = now.isoformat()
+
+            results.append({
+                "obligation_id": obl_id,
+                "type": obl["type"],
+                "title": obl["title"],
+                "status": status,
+                "stuck": is_stuck,
+                "stuck_reason": stuck_reason if is_stuck else None,
+                "stuck_since": stuck_since,
+                "is_deadlocked": is_deadlock,
+                "chain": chain,
+                "days_stale": days_since,
+                "severity": sev_level,
+                "severity_reason": sev_reason,
+                "severity_since": sev_since,
+            })
+
+            # Persist stuck state + severity
+            if is_stuck:
+                updates_to_persist.append({
+                    "id": obl_id,
+                    "stuck": True,
+                    "stuck_reason": stuck_reason,
+                    "stuck_since": stuck_since,
+                    "severity": sev_level,
+                    "severity_reason": sev_reason,
+                    "severity_since": sev_since,
+                })
+            elif obl.get("stuck") or obl.get("severity") != sev_level:
+                # Stuck changed or severity changed — persist
+                updates_to_persist.append({
+                    "id": obl_id,
+                    "stuck": False,
+                    "stuck_reason": None,
+                    "stuck_since": None,
+                    "severity": sev_level,
+                    "severity_reason": sev_reason,
+                    "severity_since": sev_since,
+                })
+
+        # Batch persist stuck state + severity updates
+        for update in updates_to_persist:
+            try:
+                update_payload = {
+                    "stuck": update["stuck"],
+                    "stuck_reason": update["stuck_reason"],
+                    "stuck_since": update["stuck_since"],
+                }
+                # Phase 3 Step 1: Include severity fields if present
+                if "severity" in update:
+                    update_payload["severity"] = update["severity"]
+                    update_payload["severity_reason"] = update["severity_reason"]
+                    update_payload["severity_since"] = update["severity_since"]
+                sb.table("obligations") \
+                    .update(update_payload) \
+                    .eq("id", update["id"]) \
+                    .execute()
+            except Exception as e:
+                logger.warning(f"Failed to persist stuck/severity state for {update['id']}: {e}")
+
+        stuck_count = sum(1 for r in results if r["stuck"])
+        deadlock_count = sum(1 for r in results if r["is_deadlocked"])
+
+        # Phase 3 Step 1: Severity summary counts
+        severity_counts = {}
+        for r in results:
+            sev = r.get("severity", "normal")
+            severity_counts[sev] = severity_counts.get(sev, 0) + 1
+
+        return {
+            "obligations": results,
+            "stuck_count": stuck_count,
+            "deadlocks_detected": deadlock_count,
+            "stale_threshold_days": STALE_DAYS,
+            "severity_counts": severity_counts,
+        }
+    except Exception as e:
+        logger.error(f"Stuck detection error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ==================== BACKGROUND JOBS (OPTIONAL) ====================
 
 def _scan_all_connected_users():
@@ -4127,6 +4695,11 @@ if __name__ == "__main__":
     logger.info("  POST /api/obligations/generate-recovery-drafts - Generate follow-up drafts")
     logger.info("  GET  /api/obligations/dependencies            - Evaluate dependency graph")
     logger.info("  POST /api/obligations/{id}/dependencies       - Create dependency edge")
+    logger.info("Dependency Overrides (Phase 2 Step 3):")
+    logger.info("  POST /api/obligations/{id}/overrides          - Create audited override")
+    logger.info("  GET  /api/obligations/{id}/overrides          - Get override audit trail")
+    logger.info("Stuck Detection (Phase 2 Step 4):")
+    logger.info("  GET  /api/obligations/stuck-detection          - Detect stuck obligations & deadlocks")
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
     

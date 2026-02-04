@@ -705,6 +705,112 @@ create trigger obligation_overrides_no_delete
   before delete on obligation_overrides
   for each row execute function prevent_obligation_override_mutation();
 
+-- ==========================================
+-- 12. Phase 2 Step 4: Stuck Detection (structural immobility)
+-- ==========================================
+--
+-- WHY STUCK DETECTION EXISTS:
+-- A system that blocks without explanation gets abandoned.
+-- A system that explains deadlock becomes trusted.
+--
+-- WHAT "STUCK" MEANS:
+-- An obligation is STUCK when:
+--   1. status = pending OR blocked
+--   2. All forward paths are blocked (deps unmet, proof missing, etc.)
+--   3. No status change has occurred in STALE_DAYS (default: 5)
+--
+-- This is NOT inactivity. This is structural immobility.
+--
+-- STUCK STATE IS SYSTEM-DERIVED:
+-- Users cannot set stuck = true. The system computes it.
+-- The stuck detection endpoint evaluates and persists stuck state.
+--
+-- GUARDRAILS:
+-- - No auto-un-sticking. Only a status change clears stuck.
+-- - No auto-overrides. Stuck detection does not resolve blocks.
+-- - No AI explanations. Only factual state descriptions.
+-- - No hiding stuck state after override. Overrides don't clear stuck.
+
+-- Track when status actually changed (not just any field update).
+-- This is critical: the updated_at trigger fires on ANY update (including stuck field updates).
+-- status_changed_at only changes when the actual status enum changes.
+alter table obligations add column if not exists status_changed_at timestamptz default now();
+
+create or replace function set_obligation_status_changed_at()
+returns trigger as $$
+begin
+  if tg_op = 'INSERT' then
+    new.status_changed_at = now();
+  elsif new.status is distinct from old.status then
+    new.status_changed_at = now();
+  end if;
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists obligations_set_status_changed_at on obligations;
+create trigger obligations_set_status_changed_at
+  before insert or update on obligations
+  for each row execute function set_obligation_status_changed_at();
+
+-- Stuck state columns. System-derived. Not user-editable.
+alter table obligations add column if not exists stuck boolean not null default false;
+alter table obligations add column if not exists stuck_reason text check (stuck_reason is null or stuck_reason in (
+  'unmet_dependency',
+  'overridden_dependency',
+  'missing_proof',
+  'external_verification_pending',
+  'hard_deadline_passed'
+));
+alter table obligations add column if not exists stuck_since timestamptz;
+
+-- Index for querying stuck obligations
+create index if not exists idx_obligations_stuck on obligations(user_id, stuck) where stuck = true;
+
+
+-- ==========================================
+-- 13. Phase 3 Step 1: Severity (deterministic consequence level)
+-- ==========================================
+--
+-- WHY SEVERITY EXISTS:
+-- Escalation (Phase 1 Step 5) drives BEHAVIORAL checks (blocking verification).
+-- Severity drives VISUAL treatment (badges, row colors, stat cards).
+-- Both are deterministic. Both are arithmetic. They serve different purposes.
+--
+-- SEVERITY IS NOT USER-EDITABLE.
+-- The system derives severity from: deadline distance, stuck state, verification state.
+-- If the facts change, severity changes. Users cannot override severity.
+--
+-- FIVE LEVELS (EXACT LIST):
+-- normal, elevated, high, critical, failed
+-- No others. No "medium." No "warning." No "info."
+--
+-- PERSISTENCE:
+-- severity, severity_since, severity_reason are system-derived columns.
+-- severity_reason is a single dominant cause string, not prose.
+-- The stuck detection endpoint computes and persists severity alongside stuck state.
+
+alter table obligations add column if not exists severity text not null default 'normal'
+  check (severity in ('normal', 'elevated', 'high', 'critical', 'failed'));
+
+alter table obligations add column if not exists severity_since timestamptz;
+
+alter table obligations add column if not exists severity_reason text check (severity_reason is null or severity_reason in (
+  'verified',
+  'deadline_passed',
+  'stuck_deadline_imminent',
+  'deadline_imminent',
+  'stuck_deadline_approaching',
+  'deadline_approaching',
+  'stuck_no_deadline_pressure',
+  'no_pressure'
+));
+
+-- Index for querying obligations by severity (e.g., "show me all critical/failed")
+create index if not exists idx_obligations_severity on obligations(user_id, severity)
+  where severity in ('high', 'critical', 'failed');
+
+
 -- Update the dependency enforcement trigger to respect overrides.
 -- A dependency is "met" if EITHER:
 --   (a) the dependency obligation has status = 'verified', OR

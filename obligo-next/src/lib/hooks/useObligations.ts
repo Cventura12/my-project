@@ -29,6 +29,33 @@ export interface ObligationBlocker {
   status: string;
 }
 
+// Phase 2 Step 3: Override record. Immutable. Append-only.
+// Represents a user's deliberate decision to bypass a specific dependency block.
+// The system persists these permanently — no edits, no deletes.
+//
+// GUARDRAILS:
+// - No bulk overrides. Each override is for one (obligation, dependency) pair.
+// - No auto-overrides. The system never creates these on its own.
+// - No AI-suggested overrides. Human decision only.
+// - user_reason is required and non-empty.
+export interface ObligationOverride {
+  id: string;
+  obligation_id: string;
+  overridden_dependency_id: string;
+  user_reason: string;
+  created_at: string;
+}
+
+// Phase 2 Step 3: Overridden dependency info returned alongside blockers.
+// These are dependencies that remain unverified but no longer block because
+// the user explicitly overrode them with a reason.
+export interface OverriddenDep {
+  obligation_id: string;
+  type: string;
+  title: string;
+  status: string;
+}
+
 export interface ObligationRow {
   id: string;
   user_id: string;
@@ -41,6 +68,41 @@ export interface ObligationRow {
   proof_required: boolean;
   created_at: string;
   updated_at: string;
+  // Phase 2 Step 4: Stuck state. System-derived. Not user-editable.
+  stuck?: boolean;
+  stuck_reason?: StuckReason | null;
+  stuck_since?: string | null;
+  status_changed_at?: string;
+}
+
+// Phase 2 Step 4: Stuck reason taxonomy. Exact list. No additions.
+// These describe WHY nothing is progressing — not what to do about it.
+export type StuckReason =
+  | "unmet_dependency"
+  | "overridden_dependency"
+  | "missing_proof"
+  | "external_verification_pending"
+  | "hard_deadline_passed";
+
+// Phase 2 Step 4: Stuck info returned by the stuck detection endpoint.
+// Includes the full chain trace for UI display.
+export interface StuckInfo {
+  obligation_id: string;
+  stuck: boolean;
+  stuck_reason: StuckReason | null;
+  stuck_since: string | null;
+  is_deadlocked: boolean;
+  days_stale: number;
+  chain: StuckChainLink[];
+}
+
+// Phase 2 Step 4: A single link in a dependency chain trace.
+export interface StuckChainLink {
+  obligation_id: string;
+  type: string;
+  title: string;
+  status: string;
+  is_cycle_back?: boolean;
 }
 
 export function useObligations() {

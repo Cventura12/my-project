@@ -5,13 +5,13 @@ import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/supabase/auth-provider";
 import { useSchools } from "@/lib/hooks/useSchools";
 import { useDocuments, Document } from "@/lib/hooks/useDocuments";
-import { useObligations, ObligationRow, ObligationBlocker } from "@/lib/hooks/useObligations";
+import { useObligations, ObligationRow, ObligationBlocker, OverriddenDep, StuckInfo } from "@/lib/hooks/useObligations";
 import { useFollowUps } from "@/lib/hooks/useFollowUps";
 import { createSupabaseBrowser } from "@/lib/supabase/client";
 import SchoolCard from "@/components/financial-aid/SchoolCard";
 import {
   Plus, LogOut, FileText, AlertTriangle, CheckCircle2, Clock,
-  Mail, FileEdit, MessageSquareWarning, Loader2, ShieldAlert, XOctagon, Ban, Lock,
+  Mail, FileEdit, MessageSquareWarning, Loader2, ShieldAlert, XOctagon, Ban, Lock, AlertCircle, Pause,
 } from "lucide-react";
 import {
   getEscalationLevel,
@@ -23,6 +23,16 @@ import {
 } from "@/lib/escalation";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+// Phase 2 Step 4: Stuck reason text.
+// Factual. No motivation. No advice. Just what's happening.
+const STUCK_REASON_TEXT: Record<string, string> = {
+  unmet_dependency: "Blocked by unverified prerequisite",
+  overridden_dependency: "Dependency overridden but no progress",
+  missing_proof: "Required proof not attached",
+  external_verification_pending: "Waiting for external verification",
+  hard_deadline_passed: "Deadline has passed",
+};
 
 export default function FinancialAidDashboard() {
   const { user, loading: authLoading, signOut } = useAuth();
@@ -44,6 +54,35 @@ export default function FinancialAidDashboard() {
   //   3. Button hiding — Submit/Verify buttons disappear when blocked (Phase 2 Step 1)
   // All three MUST stay in sync. If you add a new action button, check depBlocked.
   const [depBlockers, setDepBlockers] = useState<Record<string, ObligationBlocker[]>>({});
+
+  // Phase 2 Step 3: Overridden dependencies.
+  // Maps obligation_id -> list of dependencies that were overridden.
+  // These are still surfaced in the UI — the user sees "Dependency overridden" warnings.
+  // Overrides remove blocks, NOT accountability.
+  const [overriddenDeps, setOverriddenDeps] = useState<Record<string, OverriddenDep[]>>({});
+
+  // Phase 2 Step 3: Override flow state.
+  // When non-null, the override modal is open for a specific (obligation, blocker) pair.
+  // GUARDRAILS:
+  // - Only ONE override at a time. No bulk overrides.
+  // - Requires typed reason. Not just a click.
+  // - No AI suggestions. Human decision only.
+  const [overrideTarget, setOverrideTarget] = useState<{
+    obligationId: string;
+    blocker: ObligationBlocker;
+  } | null>(null);
+  const [overrideReason, setOverrideReason] = useState("");
+  const [overrideSubmitting, setOverrideSubmitting] = useState(false);
+
+  // Phase 2 Step 4: Stuck state.
+  // Maps obligation_id -> stuck info (reason, chain, deadlock flag).
+  // Computed server-side. No AI. No suggestions. Only factual state.
+  //
+  // GUARDRAILS:
+  // - No auto-un-sticking. Only a real status change clears stuck.
+  // - No AI explanations. The stuck reason is a taxonomy value, not prose.
+  // - No "tips" or "try this." Only "this is why nothing is moving."
+  const [stuckMap, setStuckMap] = useState<Record<string, StuckInfo>>({});
 
   const loading = authLoading || schoolsLoading || docsLoading || obligationsLoading;
 
@@ -81,17 +120,63 @@ export default function FinancialAidDashboard() {
         if (!res.ok) return;
         const data = await res.json();
         const blockerMap: Record<string, ObligationBlocker[]> = {};
+        const overriddenMap: Record<string, OverriddenDep[]> = {};
         for (const obl of data.obligations || []) {
           if (obl.blockers && obl.blockers.length > 0) {
             blockerMap[obl.obligation_id] = obl.blockers;
           }
+          // Phase 2 Step 3: Capture overridden dependencies.
+          // These are dependencies that were overridden by the user.
+          // They no longer block, but are still surfaced in the UI.
+          if (obl.overridden_deps && obl.overridden_deps.length > 0) {
+            overriddenMap[obl.obligation_id] = obl.overridden_deps;
+          }
         }
         setDepBlockers(blockerMap);
+        setOverriddenDeps(overriddenMap);
       } catch {
         // Silent fail — dependency evaluation is advisory
       }
     };
     evaluateDeps();
+  }, [user, obligationsLoading, obligations]);
+
+  // Phase 2 Step 4: Stuck detection.
+  // Calls the backend to compute stuck state (structural immobility).
+  // Returns: stuck obligations, dominant reasons, dependency chains, deadlock flags.
+  // Persists stuck state to the database (stuck, stuck_reason, stuck_since columns).
+  //
+  // GUARDRAILS:
+  // - No auto-un-sticking. The system does not resolve blocks.
+  // - No suggestions. The UI shows WHY nothing is progressing, not what to do.
+  // - No AI explanations. Taxonomy values only.
+  useEffect(() => {
+    if (!user || obligationsLoading) return;
+    const detectStuck = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/obligations/stuck-detection?user_id=${user.id}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        const map: Record<string, StuckInfo> = {};
+        for (const obl of data.obligations || []) {
+          if (obl.stuck) {
+            map[obl.obligation_id] = {
+              obligation_id: obl.obligation_id,
+              stuck: true,
+              stuck_reason: obl.stuck_reason,
+              stuck_since: obl.stuck_since,
+              is_deadlocked: obl.is_deadlocked,
+              days_stale: obl.days_stale,
+              chain: obl.chain || [],
+            };
+          }
+        }
+        setStuckMap(map);
+      } catch {
+        // Silent fail — stuck detection is advisory
+      }
+    };
+    detectStuck();
   }, [user, obligationsLoading, obligations]);
 
   // ---------------------------------------------------------------------------
@@ -305,6 +390,56 @@ export default function FinancialAidDashboard() {
     }
   };
 
+  // Phase 2 Step 3: Submit a dependency override.
+  // This is the ONLY path to create an override. It requires:
+  //   1. A specific (obligation, blocker) pair selected by the user
+  //   2. A typed reason (free text, non-empty)
+  //   3. Explicit submission (not auto-triggered)
+  //
+  // GUARDRAILS:
+  // - One override per invocation. No bulk operations.
+  // - The system NEVER calls this function on its own.
+  // - No AI suggestions. The override modal has no "suggested reasons."
+  // - After override, the dependency is still visible (marked "overridden").
+  const handleOverrideSubmit = async () => {
+    if (!user || !overrideTarget) return;
+    const reason = overrideReason.trim();
+    if (!reason) {
+      alert("A reason is required. Overrides are not silent.");
+      return;
+    }
+
+    setOverrideSubmitting(true);
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/obligations/${overrideTarget.obligationId}/overrides`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            user_id: user.id,
+            overridden_dependency_id: overrideTarget.blocker.obligation_id,
+            user_reason: reason,
+          }),
+        }
+      );
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: "Override failed" }));
+        alert(err.detail || "Override failed");
+        return;
+      }
+
+      // Close modal, reset state, re-evaluate dependencies
+      setOverrideTarget(null);
+      setOverrideReason("");
+      await refreshObligations();
+    } catch {
+      alert("Failed to create override");
+    } finally {
+      setOverrideSubmitting(false);
+    }
+  };
+
   // Group documents by school
   const docsBySchool = documents.reduce<Record<string, Document[]>>((acc, doc) => {
     if (!acc[doc.school_id]) acc[doc.school_id] = [];
@@ -458,17 +593,26 @@ export default function FinancialAidDashboard() {
                 // what to do. No ambiguity. No guessing.
                 const blockers = depBlockers[obl.id] || [];
                 const depBlocked = blockers.length > 0;
+                // Phase 2 Step 4: Stuck state.
+                const stuckInfo = stuckMap[obl.id] || null;
+                const isStuck = !!stuckInfo;
 
-                // Phase 2 Step 2: Row styling. Blocked gets its own visual treatment.
-                // If escalation is active (urgent/critical/failure), escalation styling
-                // takes priority because deadline urgency is existential. But the BLOCKED
-                // badge still appears — the user sees BOTH signals.
-                // If no escalation, blocked obligations get a slate border + gray wash
-                // to communicate "frozen — cannot proceed."
-                const rowBorder = depBlocked && escalation === "normal"
+                // Phase 2 Step 2 & 4: Row styling.
+                // Priority: stuck+escalation > escalation > stuck > blocked > normal.
+                // Stuck + escalation compounds urgency (e.g., stuck + critical = louder).
+                // Stuck alone gets an indigo treatment — distinct from all other states.
+                const rowBorder = isStuck && escalation !== "normal"
+                  ? style.rowBorder  // Escalation wins but stuck badge is visible
+                  : isStuck
+                  ? "border-l-4 border-l-indigo-500"
+                  : depBlocked && escalation === "normal"
                   ? "border-l-4 border-l-gray-500"
                   : style.rowBorder;
-                const rowBg = depBlocked && escalation === "normal"
+                const rowBg = isStuck && escalation !== "normal"
+                  ? style.rowBg  // Escalation bg + stuck badge compound
+                  : isStuck
+                  ? "bg-indigo-50/60"
+                  : depBlocked && escalation === "normal"
                   ? "bg-gray-50/70"
                   : style.rowBg;
 
@@ -487,6 +631,21 @@ export default function FinancialAidDashboard() {
                           <span className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-black uppercase rounded-full bg-gray-700 text-white border border-gray-800">
                             <Lock className="w-2.5 h-2.5" />
                             BLOCKED
+                          </span>
+                        )}
+                        {/* Phase 2 Step 4: STUCK badge — structural immobility.
+                            Shown when the obligation has not progressed for STALE_DAYS
+                            and is blocked (deps, proof, or external).
+                            Distinct from BLOCKED: BLOCKED = "you have unmet deps right now."
+                            STUCK = "nothing has moved for days, and this is why." */}
+                        {isStuck && (
+                          <span className={`shrink-0 inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-black uppercase rounded-full ${
+                            stuckInfo?.is_deadlocked
+                              ? "bg-red-800 text-white border border-red-900"
+                              : "bg-indigo-700 text-white border border-indigo-800"
+                          }`}>
+                            <Pause className="w-2.5 h-2.5" />
+                            {stuckInfo?.is_deadlocked ? "DEADLOCK" : "STUCK"}
                           </span>
                         )}
                         {/* Phase 1 Step 5: Escalation badge — intentionally loud */}
@@ -558,16 +717,103 @@ export default function FinancialAidDashboard() {
                                 ? `Verify "${b.title}"`
                                 : `Complete "${b.title}"`;
                             return (
-                              <div key={b.obligation_id} className="ml-5 mb-1 last:mb-0">
-                                <p className="text-[11px] text-gray-700 font-semibold">
-                                  {b.type}: {b.title} — <span className="uppercase text-gray-500">{b.status}</span>
-                                </p>
-                                <p className="text-[10px] text-gray-600 italic">
-                                  → {action} to unblock
-                                </p>
+                              <div key={b.obligation_id} className="ml-5 mb-1.5 last:mb-0">
+                                <div className="flex items-start justify-between gap-2">
+                                  <div>
+                                    <p className="text-[11px] text-gray-700 font-semibold">
+                                      {b.type}: {b.title} — <span className="uppercase text-gray-500">{b.status}</span>
+                                    </p>
+                                    <p className="text-[10px] text-gray-600 italic">
+                                      → {action} to unblock
+                                    </p>
+                                  </div>
+                                  {/* Phase 2 Step 3: Override button — per-blocker, deliberate.
+                                      This does NOT auto-override. It opens a modal requiring
+                                      a typed reason. The button text is "Override" not "Skip"
+                                      or "Dismiss." The language is intentionally uncomfortable. */}
+                                  <button
+                                    onClick={() => {
+                                      setOverrideTarget({ obligationId: obl.id, blocker: b });
+                                      setOverrideReason("");
+                                    }}
+                                    className="shrink-0 px-2 py-0.5 text-[9px] font-semibold rounded border border-gray-300 text-gray-500 hover:text-red-600 hover:border-red-400 transition-colors"
+                                  >
+                                    Override
+                                  </button>
+                                </div>
                               </div>
                             );
                           })}
+                        </div>
+                      )}
+                      {/* Phase 2 Step 3: Overridden dependency indicator.
+                          Shown AFTER the blocked warning (if any remaining blockers)
+                          or standalone (if all blockers were overridden).
+                          The system remembers every override. Warnings persist.
+                          Escalation severity is NOT reduced by overrides. */}
+                      {(overriddenDeps[obl.id] || []).length > 0 && (
+                        <div className="mt-2 px-3 py-2 rounded-lg text-xs font-medium bg-amber-50 text-amber-800 border border-amber-300">
+                          <div className="flex items-center gap-1.5 font-semibold mb-1">
+                            <AlertCircle className="w-3.5 h-3.5 text-amber-600" />
+                            {(overriddenDeps[obl.id] || []).length} dependency override{(overriddenDeps[obl.id] || []).length > 1 ? "s" : ""} active
+                          </div>
+                          {(overriddenDeps[obl.id] || []).map((od) => (
+                            <p key={od.obligation_id} className="text-[10px] text-amber-700 ml-5">
+                              {od.type}: {od.title} — <span className="uppercase">{od.status}</span> (overridden)
+                            </p>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Phase 2 Step 4: Stuck reason box.
+                          Shows WHY nothing is progressing. Factual. No advice.
+                          Includes the dependency chain in plain language.
+                          Deadlocks get louder treatment.
+                          Stuck + escalation = compound urgency (both badges visible,
+                          stuck box uses escalation-aware coloring when deadline is near). */}
+                      {isStuck && stuckInfo && (
+                        <div className={`mt-2 px-3 py-2.5 rounded-lg text-xs font-medium border ${
+                          stuckInfo.is_deadlocked
+                            ? "bg-red-100 text-red-900 border-red-400"
+                            : escalation === "failure" || escalation === "critical"
+                            ? "bg-red-50 text-red-800 border-red-300"
+                            : escalation === "urgent"
+                            ? "bg-yellow-50 text-yellow-900 border-yellow-300"
+                            : "bg-indigo-50 text-indigo-900 border-indigo-300"
+                        }`}>
+                          <div className="flex items-center gap-1.5 font-bold mb-1">
+                            <Pause className="w-3.5 h-3.5 shrink-0" />
+                            {stuckInfo.is_deadlocked
+                              ? "Dependency deadlock. Unresolvable by user."
+                              : `No progress for ${stuckInfo.days_stale} day${stuckInfo.days_stale !== 1 ? "s" : ""}`}
+                          </div>
+                          <p className="text-[11px] mb-1">
+                            {STUCK_REASON_TEXT[stuckInfo.stuck_reason || ""] || stuckInfo.stuck_reason}
+                          </p>
+                          {stuckInfo.chain.length > 0 && (
+                            <div className="mt-1.5 pt-1.5 border-t border-current/10">
+                              <p className="text-[10px] font-semibold uppercase mb-0.5 opacity-70">
+                                Dependency chain
+                              </p>
+                              <p className="text-[10px] font-mono">
+                                {obl.type}
+                                {stuckInfo.chain.map((link, i) => (
+                                  <span key={link.obligation_id}>
+                                    {" → "}
+                                    {link.type} ({link.status})
+                                    {link.is_cycle_back && (
+                                      <span className="font-bold text-red-600"> ← CYCLE</span>
+                                    )}
+                                  </span>
+                                ))}
+                              </p>
+                            </div>
+                          )}
+                          {stuckInfo.stuck_since && (
+                            <p className="text-[9px] mt-1 opacity-60">
+                              Stuck since {new Date(stuckInfo.stuck_since).toLocaleDateString()}
+                            </p>
+                          )}
                         </div>
                       )}
                     </div>
@@ -672,6 +918,82 @@ export default function FinancialAidDashboard() {
           </div>
         )}
       </main>
+
+      {/* Phase 2 Step 3: Override Modal.
+          FRICTION IS REQUIRED.
+          This is NOT a one-click operation. The user must:
+          1. See EXACTLY which dependency is being overridden
+          2. Read a warning that overrides are permanent and audited
+          3. Type a reason (free text, non-empty)
+          4. Click a deliberately-labeled button ("Override dependency")
+
+          GUARDRAILS ENFORCED HERE:
+          - Single override per modal. No "override all" button.
+          - No AI-suggested reasons. The textarea is empty.
+          - No "always allow" checkbox. Each override is singular.
+          - The word "override" is used, not "skip" or "dismiss." */}
+      {overrideTarget && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white border-2 border-black rounded-xl w-full max-w-md p-6">
+            <h2 className="text-lg font-bold text-black mb-1">Override Dependency</h2>
+            <p className="text-xs text-gray-500 mb-4">
+              This override is permanent and audited. It cannot be undone.
+            </p>
+
+            <div className="bg-gray-50 border border-gray-200 rounded-lg p-3 mb-4">
+              <p className="text-[10px] text-gray-400 uppercase font-semibold mb-1">You are overriding:</p>
+              <p className="text-sm font-semibold text-gray-900">
+                {overrideTarget.blocker.type}: {overrideTarget.blocker.title}
+              </p>
+              <p className="text-xs text-gray-500 mt-0.5">
+                Current status: <span className="uppercase font-semibold">{overrideTarget.blocker.status}</span>
+              </p>
+            </div>
+
+            <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-4">
+              <p className="text-xs text-red-700 font-medium">
+                This dependency exists because the system determined this obligation
+                cannot normally proceed without it. By overriding, you accept responsibility
+                for any consequences. The override will be permanently recorded.
+              </p>
+            </div>
+
+            <div className="mb-4">
+              <label className="block text-xs font-semibold text-gray-700 uppercase tracking-wider mb-1.5">
+                Reason for override <span className="text-red-500">*</span>
+              </label>
+              <textarea
+                value={overrideReason}
+                onChange={(e) => setOverrideReason(e.target.value)}
+                placeholder="Why is this dependency being overridden? (e.g., fee waived by school, alternate path confirmed)"
+                className="w-full px-3 py-2 border-2 border-gray-200 rounded-lg focus:outline-none focus:border-black transition-colors text-sm resize-none h-20"
+              />
+              {overrideReason.trim().length === 0 && (
+                <p className="text-[10px] text-red-500 mt-1">A reason is required.</p>
+              )}
+            </div>
+
+            <div className="flex items-center justify-between">
+              <button
+                onClick={() => {
+                  setOverrideTarget(null);
+                  setOverrideReason("");
+                }}
+                className="px-4 py-2 text-sm text-gray-500 hover:text-black transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleOverrideSubmit}
+                disabled={overrideSubmitting || overrideReason.trim().length === 0}
+                className="px-5 py-2 bg-red-600 text-white text-sm font-semibold rounded-lg hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                {overrideSubmitting ? "Overriding..." : "Override dependency"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
