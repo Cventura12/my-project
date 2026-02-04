@@ -206,6 +206,9 @@ def log_action(obligation_id: str, action: str, approval_status: str, score: flo
     # supabase.table('action_logs').insert(entry.dict()).execute()
 
 def get_demo_obligations() -> List[Dict]:
+    # ⚠️ NON-AUTHORITATIVE (PHASE 1 DOCTRINE)
+    # Demo obligations are legacy fallback only. Do not extend this model.
+    # Canonical work items must be stored in Supabase `obligations`.
     """Return demo obligations for testing/fallback"""
     return [
         {
@@ -1689,6 +1692,10 @@ async def clear_old_activities(days: int = 30):
         raise HTTPException(status_code=500, detail=str(e))
 
 # ==================== MANUAL OBLIGATION ENDPOINTS ====================
+# ⚠️ NON-AUTHORITATIVE (PHASE 1 DOCTRINE)
+# These endpoints originally created an in-memory "manual obligations" system.
+# That is NOT canonical. Keep the endpoints for compatibility, but route creation
+# into Supabase `obligations` and treat the in-memory store as a temporary cache only.
 
 class ManualObligation(BaseModel):
     title: str
@@ -2764,6 +2771,298 @@ async def get_email_connection(user_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== OBLIGATIONS (CANONICAL) ENDPOINTS ====================
+
+@app.get("/api/obligations")
+async def list_obligations(user_id: str, status: Optional[str] = None, limit: int = 100):
+    """
+    List canonical obligations for a user (Supabase-backed).
+
+    Phase 1 spine: obligations are the single source of truth for "things due".
+    """
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        query = sb.table("obligations") \
+            .select("*") \
+            .eq("user_id", user_id) \
+            .order("deadline", desc=False) \
+            .limit(limit)
+
+        if status:
+            query = query.eq("status", status)
+
+        result = query.execute()
+        return {"obligations": result.data or [], "count": len(result.data or [])}
+    except Exception as e:
+        logger.error(f"Obligations list error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ObligationStatusUpdateRequest(BaseModel):
+    user_id: str
+    status: str  # pending | submitted | verified | blocked
+
+
+class ObligationProofCreateRequest(BaseModel):
+    user_id: str
+    type: str  # receipt | confirmation_email | portal_screenshot | file_upload
+    source_ref: str  # gmail_id | file_url | manual note
+
+
+class AttachConfirmationEmailProofRequest(BaseModel):
+    user_id: str
+    analyzed_email_id: str  # analyzed_emails.id (NOT gmail_id)
+
+
+_OBLIGATION_STATUSES = {"pending", "submitted", "verified", "blocked"}
+_PROOF_TYPES = {"receipt", "confirmation_email", "portal_screenshot", "file_upload"}
+
+
+def _looks_like_confirmation_email(subject: str, snippet: str, summary: str) -> bool:
+    """
+    Minimal heuristic: allow linking only when the email appears to be a receipt/confirmation.
+
+    This is intentionally conservative. If it's not clearly a confirmation, block it.
+    """
+    text = " ".join([subject or "", snippet or "", summary or ""]).lower()
+    keywords = [
+        "confirmation",
+        "confirmed",
+        "receipt",
+        "payment received",
+        "we received",
+        "we have received",
+        "received your",
+        "successfully submitted",
+        "submission received",
+        "application received",
+        "deposit received",
+        "thank you for your submission",
+        "thank you for submitting",
+    ]
+    return any(k in text for k in keywords)
+
+
+@app.post("/api/obligations/{obligation_id}/status")
+async def update_obligation_status(obligation_id: str, request: ObligationStatusUpdateRequest):
+    """
+    Update canonical obligation status (Supabase-backed).
+
+    Phase 1 Step 3 (Authority): "verified" is proof-gated server-side.
+    Phase 2 Step 1 (Dependencies): "submitted"/"verified" are dependency-gated.
+    Any path that attempts these without meeting prerequisites is INVALID and must be blocked.
+    """
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        if request.status not in _OBLIGATION_STATUSES:
+            raise HTTPException(status_code=400, detail="Invalid status")
+
+        # Fetch obligation (ownership check)
+        obligation_res = sb.table("obligations") \
+            .select("*") \
+            .eq("id", obligation_id) \
+            .eq("user_id", request.user_id) \
+            .single() \
+            .execute()
+        obligation = getattr(obligation_res, "data", None)
+        if not obligation:
+            raise HTTPException(status_code=404, detail="Obligation not found")
+
+        # Phase 2 Step 1 & 3: Dependency-gated transitions.
+        # Cannot transition to submitted or verified if any dependency is unmet.
+        # This is checked BEFORE proof-gating because dependencies are more fundamental.
+        # Phase 2 Step 3: Overridden dependencies are excluded from blocking.
+        if request.status in ("submitted", "verified"):
+            deps_res = sb.table("obligation_dependencies") \
+                .select("depends_on_obligation_id") \
+                .eq("obligation_id", obligation_id) \
+                .execute()
+            dep_ids = [d["depends_on_obligation_id"] for d in (deps_res.data or [])]
+
+            if dep_ids:
+                # Phase 2 Step 3: Fetch overrides for this obligation
+                overrides_res = sb.table("obligation_overrides") \
+                    .select("overridden_dependency_id") \
+                    .eq("obligation_id", obligation_id) \
+                    .execute()
+                overridden_ids = {
+                    o["overridden_dependency_id"]
+                    for o in (overrides_res.data or [])
+                }
+
+                # Fetch statuses of all dependency obligations
+                dep_obls_res = sb.table("obligations") \
+                    .select("id, type, title, status") \
+                    .in_("id", dep_ids) \
+                    .execute()
+                dep_obls = dep_obls_res.data or []
+
+                # Phase 2 Step 3: Only block on unmet dependencies that are NOT overridden
+                unmet = [
+                    d for d in dep_obls
+                    if d["status"] != "verified"
+                    and d["id"] not in overridden_ids
+                ]
+                if unmet:
+                    blockers = [
+                        f"{d['type']} (\"{d['title']}\", status: {d['status']})"
+                        for d in unmet
+                    ]
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Blocked: this obligation depends on {len(unmet)} unverified "
+                            f"prerequisite(s) that must be completed first:\n"
+                            + "\n".join(f"  - {b}" for b in blockers)
+                        ),
+                    )
+
+        # Proof-gated verification (explicit, clear error)
+        if request.status == "verified" and obligation.get("proof_required", False):
+            proofs_res = sb.table("obligation_proofs") \
+                .select("id") \
+                .eq("obligation_id", obligation_id) \
+                .limit(1) \
+                .execute()
+            proofs = getattr(proofs_res, "data", None) or []
+            if len(proofs) == 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Blocked: proof is required to verify this obligation. Attach proof first.",
+                )
+
+        # Update (DB triggers also enforce proof-gating and dependency-gating as safety nets)
+        updated_res = sb.table("obligations") \
+            .update({"status": request.status}) \
+            .eq("id", obligation_id) \
+            .eq("user_id", request.user_id) \
+            .select("*") \
+            .single() \
+            .execute()
+
+        updated = getattr(updated_res, "data", None)
+        if not updated:
+            raise HTTPException(status_code=500, detail="Failed to update obligation")
+
+        return {"status": "updated", "obligation": updated}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Obligation status update error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/obligations/{obligation_id}/proofs")
+async def create_obligation_proof(obligation_id: str, request: ObligationProofCreateRequest):
+    """
+    Append a proof artifact to an obligation.
+
+    Proofs are append-only by database rule.
+    """
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        proof_type = (request.type or "").strip()
+        source_ref = (request.source_ref or "").strip()
+        if proof_type not in _PROOF_TYPES:
+            raise HTTPException(status_code=400, detail="Invalid proof type")
+        if not source_ref:
+            raise HTTPException(status_code=400, detail="source_ref is required")
+
+        obligation_res = sb.table("obligations") \
+            .select("id") \
+            .eq("id", obligation_id) \
+            .eq("user_id", request.user_id) \
+            .single() \
+            .execute()
+        if not getattr(obligation_res, "data", None):
+            raise HTTPException(status_code=404, detail="Obligation not found")
+
+        inserted_res = sb.table("obligation_proofs").insert({
+            "obligation_id": obligation_id,
+            "type": proof_type,
+            "source_ref": source_ref,
+        }).select("*").single().execute()
+
+        inserted = getattr(inserted_res, "data", None)
+        if not inserted:
+            raise HTTPException(status_code=500, detail="Failed to create proof")
+
+        return {"status": "created", "proof": inserted}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Create proof error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/obligations/{obligation_id}/proofs/attach-confirmation-email")
+async def attach_confirmation_email_as_proof(obligation_id: str, request: AttachConfirmationEmailProofRequest):
+    """
+    Attach a confirmation/receipt email as proof.
+
+    IMPORTANT:
+    - Does NOT auto-verify.
+    - Requires explicit user action (this endpoint is the explicit attach).
+    - Blocks if the email does not look like a confirmation.
+    """
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        # Ownership check
+        obligation_res = sb.table("obligations") \
+            .select("id") \
+            .eq("id", obligation_id) \
+            .eq("user_id", request.user_id) \
+            .single() \
+            .execute()
+        if not getattr(obligation_res, "data", None):
+            raise HTTPException(status_code=404, detail="Obligation not found")
+
+        email_res = sb.table("analyzed_emails") \
+            .select("id,gmail_id,subject,snippet,summary") \
+            .eq("id", request.analyzed_email_id) \
+            .eq("user_id", request.user_id) \
+            .single() \
+            .execute()
+        email = getattr(email_res, "data", None)
+        if not email:
+            raise HTTPException(status_code=404, detail="Analyzed email not found")
+
+        gmail_id = email.get("gmail_id")
+        if not gmail_id:
+            raise HTTPException(status_code=400, detail="Email has no gmail_id; cannot attach as confirmation proof")
+
+        if not _looks_like_confirmation_email(email.get("subject"), email.get("snippet"), email.get("summary")):
+            raise HTTPException(
+                status_code=400,
+                detail="Blocked: email does not look like a receipt/confirmation; refusing to attach as confirmation_email proof.",
+            )
+
+        inserted_res = sb.table("obligation_proofs").insert({
+            "obligation_id": obligation_id,
+            "type": "confirmation_email",
+            "source_ref": gmail_id,
+        }).select("*").single().execute()
+
+        inserted = getattr(inserted_res, "data", None)
+        if not inserted:
+            raise HTTPException(status_code=500, detail="Failed to attach proof")
+
+        return {"status": "attached", "proof": inserted}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Attach confirmation email proof error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ==================== EMAIL DRAFTING & APPROVAL ENDPOINTS ====================
 
 class DraftEmailRequest(BaseModel):
@@ -3007,6 +3306,720 @@ async def get_draft_history(user_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==================== PHASE 1 STEP 4: PROOF-MISSING DETECTION & RECOVERY DRAFTS ====================
+#
+# GUARDRAILS (enforced here, not negotiable):
+# - No auto-sending. Drafts are ALWAYS stored as pending_approval.
+# - No chaining. One draft per unmet proof-missing condition unless user triggers another.
+# - No auto-verification. Sending the follow-up does NOT mark the obligation as verified.
+# - If something feels "smart" — it was removed.
+#
+
+# Configurable threshold (hours). Default: 48 hours after submission.
+PROOF_MISSING_THRESHOLD_HOURS = int(os.getenv("PROOF_MISSING_THRESHOLD_HOURS", "48"))
+
+
+@app.get("/api/obligations/proof-missing")
+async def detect_proof_missing_obligations(user_id: str):
+    """
+    Detect obligations stuck in "submitted" without proof.
+
+    Condition:
+    - obligation.status = "submitted"
+    - obligation.proof_required = true
+    - no rows in obligation_proofs for this obligation
+    - submitted_at is older than PROOF_MISSING_THRESHOLD_HOURS (default 48h)
+
+    Returns list of obligations meeting this condition, annotated with
+    whether a recovery draft already exists.
+
+    THIS ENDPOINT DOES NOT SEND ANYTHING. It only detects.
+    """
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        # 1. Get all submitted + proof-required obligations for this user
+        obl_result = sb.table("obligations") \
+            .select("*") \
+            .eq("user_id", user_id) \
+            .eq("status", "submitted") \
+            .eq("proof_required", True) \
+            .execute()
+
+        candidates = obl_result.data or []
+        if not candidates:
+            return {"obligations": [], "count": 0}
+
+        # 2. Filter by elapsed time since submission
+        threshold = timedelta(hours=PROOF_MISSING_THRESHOLD_HOURS)
+        now = datetime.utcnow()
+        stale = []
+        for obl in candidates:
+            submitted_at = obl.get("submitted_at")
+            if not submitted_at:
+                continue
+            try:
+                submitted_dt = datetime.fromisoformat(submitted_at.replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                continue
+            if (now - submitted_dt) >= threshold:
+                stale.append(obl)
+
+        if not stale:
+            return {"obligations": [], "count": 0}
+
+        # 3. Check which have NO proofs
+        stale_ids = [o["id"] for o in stale]
+        proofs_result = sb.table("obligation_proofs") \
+            .select("obligation_id") \
+            .in_("obligation_id", stale_ids) \
+            .execute()
+        has_proof_ids = {p["obligation_id"] for p in (proofs_result.data or [])}
+
+        proof_missing = [o for o in stale if o["id"] not in has_proof_ids]
+
+        if not proof_missing:
+            return {"obligations": [], "count": 0}
+
+        # 4. Guardrail: check which already have an active recovery draft (one per condition)
+        pm_ids = [o["id"] for o in proof_missing]
+        existing_drafts = sb.table("follow_ups") \
+            .select("obligation_id") \
+            .eq("user_id", user_id) \
+            .eq("follow_up_type", "obligation_proof_missing") \
+            .in_("status", ["pending_approval", "draft"]) \
+            .in_("obligation_id", pm_ids) \
+            .execute()
+        has_draft_ids = {d["obligation_id"] for d in (existing_drafts.data or [])}
+
+        # Annotate each obligation
+        result = []
+        for obl in proof_missing:
+            obl["_has_recovery_draft"] = obl["id"] in has_draft_ids
+            try:
+                hours = (now - datetime.fromisoformat(obl["submitted_at"].replace("Z", "+00:00")).replace(tzinfo=None)).total_seconds() / 3600
+                obl["_hours_since_submission"] = round(hours, 1)
+            except Exception:
+                obl["_hours_since_submission"] = None
+            result.append(obl)
+
+        return {"obligations": result, "count": len(result)}
+    except Exception as e:
+        logger.error(f"Proof-missing detection error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class GenerateRecoveryDraftsRequest(BaseModel):
+    user_id: str
+    obligation_ids: Optional[list] = None  # if None, generate for ALL proof-missing obligations
+
+
+@app.post("/api/obligations/generate-recovery-drafts")
+async def generate_recovery_drafts(request: GenerateRecoveryDraftsRequest):
+    """
+    Generate follow-up email drafts for proof-missing obligations.
+
+    GUARDRAILS:
+    - Drafts are stored as "pending_approval". NEVER auto-sent.
+    - Only ONE draft per obligation (skips if one already exists).
+    - Does NOT mark obligation as verified. Proof still requires confirmation evidence.
+    - Does NOT chain follow-ups automatically.
+
+    This endpoint is triggered by the user reviewing the "follow-up recommended" state.
+    """
+    try:
+        from backend.email_drafter import draft_follow_up_email
+        from backend.email_monitor import _get_supabase
+
+        sb = _get_supabase()
+
+        # 1. Detect proof-missing obligations
+        obl_query = sb.table("obligations") \
+            .select("*") \
+            .eq("user_id", request.user_id) \
+            .eq("status", "submitted") \
+            .eq("proof_required", True)
+
+        if request.obligation_ids:
+            obl_query = obl_query.in_("id", request.obligation_ids)
+
+        obl_result = obl_query.execute()
+        candidates = obl_result.data or []
+
+        if not candidates:
+            return {"drafts_created": 0, "skipped": 0}
+
+        # 2. Filter: must have no proofs
+        candidate_ids = [o["id"] for o in candidates]
+        proofs_result = sb.table("obligation_proofs") \
+            .select("obligation_id") \
+            .in_("obligation_id", candidate_ids) \
+            .execute()
+        has_proof_ids = {p["obligation_id"] for p in (proofs_result.data or [])}
+        proof_missing = [o for o in candidates if o["id"] not in has_proof_ids]
+
+        # 3. Guardrail: skip obligations that already have an active draft
+        pm_ids = [o["id"] for o in proof_missing]
+        has_draft_ids = set()
+        if pm_ids:
+            existing_drafts = sb.table("follow_ups") \
+                .select("obligation_id") \
+                .eq("user_id", request.user_id) \
+                .eq("follow_up_type", "obligation_proof_missing") \
+                .in_("status", ["pending_approval", "draft"]) \
+                .in_("obligation_id", pm_ids) \
+                .execute()
+            has_draft_ids = {d["obligation_id"] for d in (existing_drafts.data or [])}
+
+        # 4. Get user profile
+        profile_result = sb.table("profiles").select("*").eq("id", request.user_id).single().execute()
+        profile = profile_result.data or {}
+        student_name = profile.get("full_name") or profile.get("email", "Student")
+
+        drafts_created = 0
+        skipped = 0
+
+        for obl in proof_missing:
+            # Guardrail: one draft per condition
+            if obl["id"] in has_draft_ids:
+                skipped += 1
+                continue
+
+            # Resolve school name from source_ref
+            school_name = "the financial aid office"
+            school_id = None
+            source_ref = obl.get("source_ref", "")
+            if source_ref.startswith("school:"):
+                parts = source_ref.split(":")
+                if len(parts) >= 2:
+                    school_id = parts[1]
+                    try:
+                        school_result = sb.table("schools").select("name").eq("id", school_id).single().execute()
+                        if school_result.data:
+                            school_name = school_result.data["name"]
+                    except Exception:
+                        pass
+            elif source_ref.startswith("document:"):
+                doc_id = source_ref.split(":")[1] if ":" in source_ref else None
+                if doc_id:
+                    try:
+                        doc_result = sb.table("documents").select("school_id").eq("id", doc_id).single().execute()
+                        if doc_result.data:
+                            school_id = doc_result.data["school_id"]
+                            school_result = sb.table("schools").select("name").eq("id", school_id).single().execute()
+                            if school_result.data:
+                                school_name = school_result.data["name"]
+                    except Exception:
+                        pass
+
+            submitted_at = obl.get("submitted_at", "")
+            try:
+                submitted_date = datetime.fromisoformat(submitted_at.replace("Z", "+00:00")).strftime("%B %d, %Y")
+            except Exception:
+                submitted_date = "recently"
+
+            # Generate draft — administrative, neutral, non-accusatory
+            result = draft_follow_up_email(
+                school_name=school_name,
+                document_name=obl["title"],
+                deadline=obl.get("deadline"),
+                context=f"Submitted on {submitted_date}. No confirmation received yet.",
+                student_name=student_name,
+            )
+
+            subject = result.get("subject", f"Following up: {obl['title']}")
+            body = result.get("body", "")
+
+            # Store as pending_approval — NEVER auto-send
+            sb.table("follow_ups").insert({
+                "user_id": request.user_id,
+                "school_id": school_id,
+                "obligation_id": obl["id"],
+                "follow_up_type": "obligation_proof_missing",
+                "status": "pending_approval",
+                "drafted_content": body,
+                "subject": subject,
+                "recipient_email": "",  # User must fill in before sending
+                "metadata": {
+                    "school_name": school_name,
+                    "obligation_title": obl["title"],
+                    "student_name": student_name,
+                    "submitted_at": submitted_at,
+                    "auto_generated": True,
+                    "reason": "proof_missing_after_threshold",
+                },
+            }).execute()
+
+            drafts_created += 1
+
+        return {"drafts_created": drafts_created, "skipped": skipped}
+    except Exception as e:
+        logger.error(f"Generate recovery drafts error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ====================================================================================
+# PHASE 2 STEP 1: OBLIGATION DEPENDENCIES (hardcoded ordering constraints)
+# ====================================================================================
+#
+# WHY DEPENDENCIES ARE HARDCODED:
+# The real world has ordering constraints that cannot be violated.
+# You cannot deposit for housing before being accepted.
+# You cannot submit an application before paying the fee.
+# These are FACTS, not predictions. There is no AI here and there must never be.
+#
+# WHY AI INFERENCE IS INTENTIONALLY AVOIDED:
+# AI would try to "discover" dependencies from data patterns.
+# That is wrong. A student who pays a fee after submitting (by mistake)
+# does not create a new valid ordering. The constraint is physical, not statistical.
+#
+# WHY THIS IS SAFER THAN "SMART" AUTOMATION:
+# A hardcoded map can be audited in 30 seconds.
+# An inferred dependency graph requires explaining the model.
+# If there is doubt, block. That is the rule.
+#
+# DEFAULT BIAS: If there is doubt, block.
+# ====================================================================================
+
+# Static dependency map: type -> list of required prerequisite types.
+# These are the ONLY valid ordering constraints.
+# Do not add to this map without a real-world justification.
+# Do not infer new edges from data.
+OBLIGATION_DEPENDENCY_MAP: dict[str, list[str]] = {
+    "APPLICATION_SUBMISSION": ["APPLICATION_FEE"],
+    "HOUSING_DEPOSIT": ["ACCEPTANCE"],
+    "SCHOLARSHIP_DISBURSEMENT": ["SCHOLARSHIP"],
+    "ENROLLMENT": ["FAFSA"],
+}
+
+# Extended obligation types (Phase 2 Step 1)
+_OBLIGATION_TYPES = {
+    "FAFSA", "APPLICATION_FEE", "APPLICATION_SUBMISSION",
+    "HOUSING_DEPOSIT", "SCHOLARSHIP",
+    "ACCEPTANCE", "SCHOLARSHIP_DISBURSEMENT", "ENROLLMENT",
+}
+
+
+def _extract_school_context(source_ref: str) -> Optional[str]:
+    """
+    Extract school context from obligation source_ref.
+
+    Patterns:
+    - school:{uuid}:* -> uuid
+    - document:{uuid} -> None (would require DB lookup; not done here for simplicity)
+
+    Returns school_id string or None.
+    """
+    if not source_ref:
+        return None
+    if source_ref.startswith("school:"):
+        parts = source_ref.split(":")
+        if len(parts) >= 2:
+            return parts[1]
+    return None
+
+
+@app.get("/api/obligations/dependencies")
+async def evaluate_obligation_dependencies(user_id: str):
+    """
+    Evaluate dependency state for all obligations belonging to a user.
+
+    For each obligation:
+    1. Check the static dependency map for required prerequisite types.
+    2. Find matching prerequisite obligations (same user, same school context).
+    3. Auto-create dependency edges if they don't exist.
+    4. Return blocked state and blocking reasons.
+
+    This endpoint creates dependency edges deterministically from the hardcoded map.
+    It does NOT infer new rules. It does NOT use AI.
+    """
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        # Fetch all obligations for this user
+        obl_res = sb.table("obligations") \
+            .select("*") \
+            .eq("user_id", user_id) \
+            .execute()
+        all_obligations = obl_res.data or []
+
+        if not all_obligations:
+            return {"obligations": [], "dependencies_created": 0}
+
+        # Group obligations by school context for matching
+        by_school: dict[str, list[dict]] = {}
+        for obl in all_obligations:
+            ctx = _extract_school_context(obl.get("source_ref", ""))
+            key = ctx or "__no_school__"
+            by_school.setdefault(key, []).append(obl)
+
+        # Also index by type within school context for fast lookup
+        by_school_type: dict[str, dict[str, list[dict]]] = {}
+        for school_key, obls in by_school.items():
+            by_school_type[school_key] = {}
+            for obl in obls:
+                by_school_type[school_key].setdefault(obl["type"], []).append(obl)
+
+        # Fetch existing dependency edges
+        obl_ids = [o["id"] for o in all_obligations]
+        existing_deps_res = sb.table("obligation_dependencies") \
+            .select("*") \
+            .in_("obligation_id", obl_ids) \
+            .execute()
+        existing_deps = existing_deps_res.data or []
+        existing_edges = {(d["obligation_id"], d["depends_on_obligation_id"]) for d in existing_deps}
+
+        # Auto-create edges from the hardcoded dependency map
+        edges_to_create = []
+        for obl in all_obligations:
+            obl_type = obl["type"]
+            required_types = OBLIGATION_DEPENDENCY_MAP.get(obl_type, [])
+            if not required_types:
+                continue
+
+            school_key = _extract_school_context(obl.get("source_ref", "")) or "__no_school__"
+
+            for req_type in required_types:
+                # Find prerequisite obligations in the same school context
+                candidates = by_school_type.get(school_key, {}).get(req_type, [])
+
+                # If no candidates in same school, check global (no-school) context
+                if not candidates and school_key != "__no_school__":
+                    candidates = by_school_type.get("__no_school__", {}).get(req_type, [])
+
+                for prereq in candidates:
+                    edge = (obl["id"], prereq["id"])
+                    if edge not in existing_edges:
+                        edges_to_create.append({
+                            "obligation_id": obl["id"],
+                            "depends_on_obligation_id": prereq["id"],
+                        })
+                        existing_edges.add(edge)
+
+        # Batch insert new edges
+        deps_created = 0
+        if edges_to_create:
+            try:
+                sb.table("obligation_dependencies").insert(edges_to_create).execute()
+                deps_created = len(edges_to_create)
+            except Exception as e:
+                logger.warning(f"Some dependency edges may already exist (OK): {e}")
+
+        # Now compute blocked state for each obligation
+        # Re-fetch all dependencies after potential inserts
+        all_deps_res = sb.table("obligation_dependencies") \
+            .select("obligation_id, depends_on_obligation_id") \
+            .in_("obligation_id", obl_ids) \
+            .execute()
+        all_deps = all_deps_res.data or []
+
+        # Phase 2 Step 3: Fetch all overrides for these obligations.
+        # Overrides remove specific dependency edges from blocking computation.
+        # They do NOT remove the dependency itself — just the hard block.
+        overrides_res = sb.table("obligation_overrides") \
+            .select("obligation_id, overridden_dependency_id, user_reason, created_at") \
+            .in_("obligation_id", obl_ids) \
+            .execute()
+        all_overrides = overrides_res.data or []
+
+        # Build override lookup: set of (obligation_id, overridden_dependency_id) tuples
+        override_set: set[tuple[str, str]] = set()
+        override_details: dict[str, list[dict]] = {}  # obligation_id -> list of override records
+        for ov in all_overrides:
+            override_set.add((ov["obligation_id"], ov["overridden_dependency_id"]))
+            override_details.setdefault(ov["obligation_id"], []).append(ov)
+
+        # Map obligation_id -> list of depends_on_obligation_ids
+        dep_map: dict[str, list[str]] = {}
+        for d in all_deps:
+            dep_map.setdefault(d["obligation_id"], []).append(d["depends_on_obligation_id"])
+
+        # Build obligation lookup by id
+        obl_by_id = {o["id"]: o for o in all_obligations}
+
+        # Compute result
+        result = []
+        for obl in all_obligations:
+            deps = dep_map.get(obl["id"], [])
+            blockers = []
+            overridden_deps = []
+            for dep_id in deps:
+                dep_obl = obl_by_id.get(dep_id)
+                if dep_obl and dep_obl["status"] != "verified":
+                    edge = (obl["id"], dep_id)
+                    if edge in override_set:
+                        # Phase 2 Step 3: This dependency was overridden.
+                        # It no longer blocks, but we still surface it as "overridden"
+                        # so the UI can show the override indicator.
+                        overridden_deps.append({
+                            "obligation_id": dep_id,
+                            "type": dep_obl["type"],
+                            "title": dep_obl["title"],
+                            "status": dep_obl["status"],
+                        })
+                    else:
+                        blockers.append({
+                            "obligation_id": dep_id,
+                            "type": dep_obl["type"],
+                            "title": dep_obl["title"],
+                            "status": dep_obl["status"],
+                        })
+
+            is_blocked = len(blockers) > 0
+            result.append({
+                "obligation_id": obl["id"],
+                "type": obl["type"],
+                "title": obl["title"],
+                "status": obl["status"],
+                "is_blocked": is_blocked,
+                "blockers": blockers,
+                # Phase 2 Step 3: Include overridden dependencies in the response.
+                # The UI uses this to show "Overridden dependency" indicators.
+                # Overrides remove blocks, not accountability.
+                "overridden_deps": overridden_deps,
+                "overrides": override_details.get(obl["id"], []),
+            })
+
+        return {
+            "obligations": result,
+            "dependencies_created": deps_created,
+        }
+    except Exception as e:
+        logger.error(f"Dependency evaluation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class CreateDependencyRequest(BaseModel):
+    user_id: str
+    depends_on_obligation_id: str
+
+
+# Phase 2 Step 3: Override request model.
+# GUARDRAILS ENCODED HERE:
+# - Single dependency per request (no bulk overrides)
+# - Reason is required and must be non-empty (no silent overrides)
+# - No "always_allow" field. No "apply_to_all" field. One edge. One reason. One record.
+class CreateOverrideRequest(BaseModel):
+    user_id: str
+    overridden_dependency_id: str
+    user_reason: str = Field(..., min_length=1, description="Why this override is being applied. Required.")
+
+
+@app.post("/api/obligations/{obligation_id}/dependencies")
+async def create_obligation_dependency(obligation_id: str, request: CreateDependencyRequest):
+    """
+    Manually create a dependency edge between two obligations.
+
+    This is for cases where the hardcoded map doesn't cover the relationship
+    but the user knows one obligation must come before another.
+
+    Validates:
+    - Both obligations exist and belong to the same user
+    - No self-reference
+    - No duplicate edges
+    """
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        if obligation_id == request.depends_on_obligation_id:
+            raise HTTPException(status_code=400, detail="Cannot depend on itself")
+
+        # Verify both obligations exist and belong to the user
+        obl_res = sb.table("obligations") \
+            .select("id, user_id") \
+            .eq("id", obligation_id) \
+            .eq("user_id", request.user_id) \
+            .single() \
+            .execute()
+        if not getattr(obl_res, "data", None):
+            raise HTTPException(status_code=404, detail="Obligation not found")
+
+        dep_res = sb.table("obligations") \
+            .select("id, user_id") \
+            .eq("id", request.depends_on_obligation_id) \
+            .eq("user_id", request.user_id) \
+            .single() \
+            .execute()
+        if not getattr(dep_res, "data", None):
+            raise HTTPException(status_code=404, detail="Dependency obligation not found")
+
+        # Insert edge
+        insert_res = sb.table("obligation_dependencies").insert({
+            "obligation_id": obligation_id,
+            "depends_on_obligation_id": request.depends_on_obligation_id,
+        }).execute()
+
+        return {"status": "created", "dependency": getattr(insert_res, "data", [None])[0]}
+    except HTTPException:
+        raise
+    except Exception as e:
+        if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+            raise HTTPException(status_code=409, detail="Dependency already exists")
+        logger.error(f"Create dependency error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== PHASE 2 STEP 3: OVERRIDES (AUDITED EXCEPTIONS) ====================
+#
+# DISCIPLINE: Overrides are NOT shortcuts. They are audited exceptions.
+#
+# An override removes a SPECIFIC hard block from a SPECIFIC dependency edge.
+# It does NOT:
+# - Auto-suggest itself
+# - Apply to other obligations
+# - Reduce escalation severity
+# - Silence warnings
+#
+# Every override is persisted as an immutable record. The system remembers.
+#
+# GUARDRAILS (enforced across all layers):
+# 1. One dependency override per request (no bulk overrides)
+# 2. User must provide a non-empty reason (no silent overrides)
+# 3. The override endpoint is POST-only (no auto-creation, no GET-triggered side effects)
+# 4. No "apply to all similar" option exists. Each edge is overridden individually.
+# 5. AI must NEVER suggest or auto-create overrides. Human decision only.
+
+
+@app.post("/api/obligations/{obligation_id}/overrides")
+async def create_obligation_override(obligation_id: str, request: CreateOverrideRequest):
+    """
+    Create an audited override for a specific dependency block.
+
+    This removes the hard block for ONE dependency edge.
+    The override is immutable — once created, it cannot be edited or deleted.
+
+    Validates:
+    - Obligation exists and belongs to the user
+    - Dependency obligation exists and belongs to the user
+    - A dependency edge actually exists between them
+    - Reason is non-empty
+    - No duplicate overrides
+    """
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        reason = (request.user_reason or "").strip()
+        if not reason:
+            raise HTTPException(status_code=400, detail="Override reason is required. Overrides are not silent.")
+
+        if obligation_id == request.overridden_dependency_id:
+            raise HTTPException(status_code=400, detail="Cannot override self-dependency")
+
+        # Verify obligation exists and belongs to user
+        obl_res = sb.table("obligations") \
+            .select("id, user_id, type, title") \
+            .eq("id", obligation_id) \
+            .eq("user_id", request.user_id) \
+            .single() \
+            .execute()
+        if not getattr(obl_res, "data", None):
+            raise HTTPException(status_code=404, detail="Obligation not found")
+
+        # Verify dependency obligation exists and belongs to user
+        dep_res = sb.table("obligations") \
+            .select("id, user_id, type, title, status") \
+            .eq("id", request.overridden_dependency_id) \
+            .eq("user_id", request.user_id) \
+            .single() \
+            .execute()
+        dep_obl = getattr(dep_res, "data", None)
+        if not dep_obl:
+            raise HTTPException(status_code=404, detail="Dependency obligation not found")
+
+        # Verify a dependency edge actually exists (can't override a non-existent block)
+        edge_res = sb.table("obligation_dependencies") \
+            .select("id") \
+            .eq("obligation_id", obligation_id) \
+            .eq("depends_on_obligation_id", request.overridden_dependency_id) \
+            .execute()
+        edge_data = getattr(edge_res, "data", None) or []
+        if not edge_data:
+            raise HTTPException(
+                status_code=400,
+                detail="No dependency edge exists between these obligations. Cannot override a non-existent block."
+            )
+
+        # Verify the dependency is actually unmet (no point overriding a verified dependency)
+        if dep_obl.get("status") == "verified":
+            raise HTTPException(
+                status_code=400,
+                detail="This dependency is already verified. No override needed."
+            )
+
+        # Insert override (immutable, append-only)
+        insert_res = sb.table("obligation_overrides").insert({
+            "obligation_id": obligation_id,
+            "overridden_dependency_id": request.overridden_dependency_id,
+            "user_reason": reason,
+        }).execute()
+
+        override_data = (getattr(insert_res, "data", None) or [None])[0]
+
+        logger.info(
+            f"Override created: obligation={obligation_id}, "
+            f"overridden_dep={request.overridden_dependency_id}, "
+            f"reason={reason!r}"
+        )
+
+        return {
+            "status": "override_created",
+            "override": override_data,
+            "warning": (
+                "This override removes the hard block but does NOT change the dependency status. "
+                "The overridden dependency is still tracked. Escalation remains active."
+            ),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        if "duplicate" in str(e).lower() or "unique" in str(e).lower():
+            raise HTTPException(status_code=409, detail="Override already exists for this dependency edge")
+        if "append-only" in str(e).lower():
+            raise HTTPException(status_code=409, detail="Override already exists (append-only)")
+        logger.error(f"Create override error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/obligations/{obligation_id}/overrides")
+async def get_obligation_overrides(obligation_id: str, user_id: str):
+    """
+    Get all overrides for a specific obligation.
+
+    Returns the full audit trail: which dependencies were overridden, why, and when.
+    """
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        # Verify obligation belongs to user
+        obl_res = sb.table("obligations") \
+            .select("id") \
+            .eq("id", obligation_id) \
+            .eq("user_id", user_id) \
+            .single() \
+            .execute()
+        if not getattr(obl_res, "data", None):
+            raise HTTPException(status_code=404, detail="Obligation not found")
+
+        # Fetch overrides
+        overrides_res = sb.table("obligation_overrides") \
+            .select("*") \
+            .eq("obligation_id", obligation_id) \
+            .order("created_at", desc=False) \
+            .execute()
+
+        return {"overrides": overrides_res.data or []}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get overrides error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ==================== BACKGROUND JOBS (OPTIONAL) ====================
 
 def _scan_all_connected_users():
@@ -3109,6 +4122,11 @@ if __name__ == "__main__":
     logger.info("  POST /api/draft/cancel           - Cancel a draft")
     logger.info("  GET  /api/draft/pending          - Get pending approvals")
     logger.info("  GET  /api/draft/history          - Get all drafts")
+    logger.info("Proof-Missing Recovery (Phase 1 Step 4):")
+    logger.info("  GET  /api/obligations/proof-missing          - Detect unverified obligations")
+    logger.info("  POST /api/obligations/generate-recovery-drafts - Generate follow-up drafts")
+    logger.info("  GET  /api/obligations/dependencies            - Evaluate dependency graph")
+    logger.info("  POST /api/obligations/{id}/dependencies       - Create dependency edge")
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
     

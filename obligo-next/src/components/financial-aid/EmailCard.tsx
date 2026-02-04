@@ -4,12 +4,11 @@ import { AnalyzedEmail } from "@/lib/hooks/useEmails";
 import {
   Mail,
   AlertTriangle,
-  Calendar,
   ExternalLink,
   X,
   GraduationCap,
   FileText,
-  Clock,
+  Calendar,
   Info,
 } from "lucide-react";
 
@@ -28,24 +27,37 @@ const categoryIcons: Record<string, typeof Mail> = {
   general: Mail,
 };
 
-function daysUntil(dateStr: string): string {
-  const d = new Date(dateStr);
-  const now = new Date();
-  const diff = Math.ceil((d.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
-  if (diff < 0) return `${Math.abs(diff)}d overdue`;
-  if (diff === 0) return "Today";
-  if (diff === 1) return "Tomorrow";
-  return `${diff}d`;
-}
-
 interface EmailCardProps {
   email: AnalyzedEmail;
   onDismiss: (id: string) => void;
+  onAttachConfirmationProof?: (email: AnalyzedEmail) => void;
 }
 
-export default function EmailCard({ email, onDismiss }: EmailCardProps) {
+function looksLikeConfirmationEmail(email: AnalyzedEmail): boolean {
+  const text = `${email.subject || ""} ${email.snippet || ""} ${email.summary || ""}`.toLowerCase();
+  const keywords = [
+    "confirmation",
+    "confirmed",
+    "receipt",
+    "payment received",
+    "we received",
+    "we have received",
+    "received your",
+    "successfully submitted",
+    "submission received",
+    "application received",
+    "deposit received",
+    "thank you for your submission",
+    "thank you for submitting",
+  ];
+  return keywords.some((k) => text.includes(k));
+}
+
+export default function EmailCard({ email, onDismiss, onAttachConfirmationProof }: EmailCardProps) {
   const colors = relevanceColors[email.relevance] || relevanceColors.low;
   const CategoryIcon = categoryIcons[email.category || "general"] || Mail;
+  const canAttachConfirmationProof =
+    Boolean(onAttachConfirmationProof) && Boolean(email.gmail_id) && looksLikeConfirmationEmail(email);
 
   return (
     <div className={`bg-white border-2 border-black rounded-xl p-4 ${email.requires_action ? "" : "opacity-80"}`}>
@@ -62,7 +74,7 @@ export default function EmailCard({ email, onDismiss }: EmailCardProps) {
 
             {/* Sender + date */}
             <p className="text-xs text-gray-400 mt-0.5 truncate">
-              {email.sender} {email.received_at && `· ${new Date(email.received_at).toLocaleDateString()}`}
+              {email.sender} {email.received_at && `- ${new Date(email.received_at).toLocaleDateString()}`}
             </p>
 
             {/* AI Summary */}
@@ -94,12 +106,14 @@ export default function EmailCard({ email, onDismiss }: EmailCardProps) {
                 </span>
               )}
 
-              {/* Deadline */}
-              {email.deadline && (
-                <span className="px-2 py-0.5 text-[10px] font-medium text-orange-700 bg-orange-50 rounded-full flex items-center gap-1">
-                  <Clock className="w-3 h-3" />
-                  {daysUntil(email.deadline)}
-                </span>
+              {canAttachConfirmationProof && (
+                <button
+                  onClick={() => onAttachConfirmationProof?.(email)}
+                  className="px-2 py-0.5 text-[10px] font-semibold uppercase rounded-full bg-amber-50 text-amber-700 border border-amber-200 hover:border-amber-300 transition-colors"
+                  title="Attach as confirmation_email proof (does not auto-verify)"
+                >
+                  Attach proof
+                </button>
               )}
             </div>
 

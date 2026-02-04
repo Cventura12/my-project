@@ -4,6 +4,54 @@ import { useState, useEffect, useCallback } from "react";
 import { createSupabaseBrowser } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/supabase/auth-provider";
 
+// ⚠️ NON-AUTHORITATIVE (PHASE 1 DOCTRINE)
+// `schools` may exist for grouping/context, but deadlines are canonical only in `obligations`.
+
+type ObligationType =
+  | "FAFSA"
+  | "APPLICATION_FEE"
+  | "APPLICATION_SUBMISSION"
+  | "HOUSING_DEPOSIT"
+  | "SCHOLARSHIP";
+
+function buildSchoolDeadlineObligations(params: {
+  userId: string;
+  schoolId: string;
+  schoolName: string;
+  applicationDeadline?: string | null;
+  financialAidDeadline?: string | null;
+}) {
+  const obligations: any[] = [];
+
+  if (params.applicationDeadline) {
+    obligations.push({
+      user_id: params.userId,
+      type: "APPLICATION_SUBMISSION" as ObligationType,
+      title: `Submit application — ${params.schoolName}`,
+      source: "manual",
+      source_ref: `school:${params.schoolId}:application_deadline`,
+      deadline: params.applicationDeadline,
+      status: "pending",
+      proof_required: false,
+    });
+  }
+
+  if (params.financialAidDeadline) {
+    obligations.push({
+      user_id: params.userId,
+      type: "FAFSA" as ObligationType,
+      title: `Submit FAFSA — ${params.schoolName}`,
+      source: "manual",
+      source_ref: `school:${params.schoolId}:financial_aid_deadline`,
+      deadline: params.financialAidDeadline,
+      status: "pending",
+      proof_required: true,
+    });
+  }
+
+  return obligations;
+}
+
 export interface School {
   id: string;
   user_id: string;
@@ -67,8 +115,9 @@ export function useSchools() {
         user_id: user.id,
         name: input.name,
         application_type: input.application_type || "undergraduate",
-        application_deadline: input.application_deadline || null,
-        financial_aid_deadline: input.financial_aid_deadline || null,
+        // Phase 1 doctrine: do not store canonical deadlines on `schools`.
+        application_deadline: null,
+        financial_aid_deadline: null,
         notes: input.notes || null,
       })
       .select()
@@ -78,16 +127,58 @@ export function useSchools() {
       setError(error.message);
       return null;
     }
+
+    // Route any provided deadlines into canonical `obligations`.
+    try {
+      const obligations = buildSchoolDeadlineObligations({
+        userId: user.id,
+        schoolId: data.id,
+        schoolName: data.name,
+        applicationDeadline: input.application_deadline || null,
+        financialAidDeadline: input.financial_aid_deadline || null,
+      });
+      if (obligations.length > 0) {
+        await supabase.from("obligations").upsert(obligations, {
+          onConflict: "user_id,source,source_ref",
+        });
+      }
+    } catch (e) {
+      console.error("Failed to route school deadlines -> obligations:", e);
+    }
+
     setSchools((prev) => [data, ...prev]);
     return data;
   };
 
   const updateSchool = async (id: string, updates: Partial<School>) => {
-    const { error } = await supabase.from("schools").update(updates).eq("id", id);
+    // Phase 1 doctrine: do not write deadlines on `schools` (route to obligations instead).
+    const { application_deadline, financial_aid_deadline, ...rest } = updates as any;
+    const { error } = await supabase.from("schools").update(rest).eq("id", id);
     if (error) {
       setError(error.message);
       return false;
     }
+
+    try {
+      const school = schools.find((s) => s.id === id);
+      if (school) {
+        const obligations = buildSchoolDeadlineObligations({
+          userId: school.user_id,
+          schoolId: school.id,
+          schoolName: school.name,
+          applicationDeadline: application_deadline || null,
+          financialAidDeadline: financial_aid_deadline || null,
+        });
+        if (obligations.length > 0) {
+          await supabase.from("obligations").upsert(obligations, {
+            onConflict: "user_id,source,source_ref",
+          });
+        }
+      }
+    } catch (e) {
+      console.error("Failed to route updated school deadlines -> obligations:", e);
+    }
+
     setSchools((prev) => prev.map((s) => (s.id === id ? { ...s, ...updates } : s)));
     return true;
   };

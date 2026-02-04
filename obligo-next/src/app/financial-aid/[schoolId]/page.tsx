@@ -10,6 +10,16 @@ import DocumentStatusModal from "@/components/financial-aid/DocumentStatusModal"
 import AddDocumentForm from "@/components/financial-aid/AddDocumentForm";
 import { ArrowLeft, Trash2, FileText, CheckCircle2, Clock, AlertTriangle } from "lucide-react";
 
+// Phase 2 Step 2 BYPASS AUDIT:
+// This page manages DOCUMENTS (paperwork tracking), not OBLIGATIONS (completion tracking).
+// updateDocumentStatus() changes document status only. It does NOT transition obligation
+// status. Obligation status transitions are gated by:
+//   1. Dependency blockers (Phase 2 Step 1) — checked in financial-aid/page.tsx
+//   2. Proof requirements (Phase 1 Step 3) — checked in financial-aid/page.tsx
+//   3. Escalation blocking (Phase 1 Step 5) — checked in financial-aid/page.tsx
+//   4. Database trigger enforce_obligation_dependencies — server-side safety net
+//
+// No obligation dependency bypass exists through this page.
 export default function SchoolDetailPage() {
   const params = useParams();
   const router = useRouter();
@@ -68,16 +78,6 @@ export default function SchoolDetailPage() {
               <h1 className="text-xl font-bold text-black">{school.name}</h1>
               <div className="flex items-center gap-3 mt-1">
                 <span className="text-xs font-medium text-gray-400 uppercase">{school.application_type}</span>
-                {school.financial_aid_deadline && (
-                  <span className="text-xs text-gray-500">
-                    Aid deadline:{" "}
-                    {new Date(school.financial_aid_deadline).toLocaleDateString("en-US", {
-                      month: "short",
-                      day: "numeric",
-                      year: "numeric",
-                    })}
-                  </span>
-                )}
               </div>
             </div>
             <button

@@ -28,6 +28,38 @@ logger = logging.getLogger(__name__)
 GMAIL_API_BASE = "https://www.googleapis.com/gmail/v1"
 
 
+def _classify_obligation_type(text: str) -> str:
+    """
+    Minimal, rule-based classifier for the Phase 1 spine.
+    Correct routing > correctness. Default to APPLICATION_SUBMISSION.
+    """
+    t = (text or "").lower()
+
+    if "fafsa" in t or "fsa id" in t:
+        return "FAFSA"
+    if "scholarship" in t or "grant" in t:
+        return "SCHOLARSHIP"
+    if ("housing" in t and "deposit" in t) or "housing deposit" in t:
+        return "HOUSING_DEPOSIT"
+    if ("application" in t and "fee" in t) or "application fee" in t:
+        return "APPLICATION_FEE"
+
+    return "APPLICATION_SUBMISSION"
+
+
+def _proof_required_for_type(obligation_type: str) -> bool:
+    # Phase 1: conservative defaults; proof storage is out of scope.
+    return obligation_type in {"FAFSA", "APPLICATION_FEE", "HOUSING_DEPOSIT"}
+
+
+def _build_obligation_title(subject: str, analysis: Dict[str, Any]) -> str:
+    # Prefer explicit action wording; fall back to summary/subject.
+    title = (analysis.get("action_needed") or analysis.get("summary") or subject or "").strip()
+    if not title:
+        return "Follow up"
+    return title[:200]
+
+
 def _get_supabase() -> SupabaseClient:
     """Create Supabase admin client using service role or anon key."""
     url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL", "")
@@ -205,7 +237,9 @@ class EmailMonitor:
                     "requires_action": analysis["requires_action"],
                     "summary": analysis["summary"],
                     "action_needed": analysis["action_needed"],
-                    "deadline": analysis["deadline"],
+                    # Phase 1 doctrine: deadlines are canonical only in `obligations`.
+                    # Keep analyzed_emails as signals-only and do not store deadlines here.
+                    "deadline": None,
                     "deadline_implied": analysis["deadline_implied"],
                     "relevance": analysis["relevance"],
                     "category": analysis["category"],
@@ -216,6 +250,37 @@ class EmailMonitor:
                 new_count += 1
                 if analysis["requires_action"]:
                     actionable_count += 1
+
+                # Phase 1 spine: route actionable intent into canonical `obligations`.
+                should_create_obligation = bool(analysis.get("deadline") or analysis.get("requires_action") or analysis.get("action_needed"))
+                if should_create_obligation:
+                    try:
+                        text_for_classification = " ".join([
+                            email.get("subject", ""),
+                            analysis.get("summary", "") or "",
+                            analysis.get("action_needed", "") or "",
+                            email.get("body", "") or "",
+                        ])
+                        obligation_type = _classify_obligation_type(text_for_classification)
+                        title = _build_obligation_title(email.get("subject", ""), analysis)
+                        obligation_row = {
+                            "user_id": user_id,
+                            "type": obligation_type,
+                            "title": title,
+                            "source": "email",
+                            "source_ref": email["gmail_id"],
+                            # Canonical deadline lives here.
+                            "deadline": analysis.get("deadline"),
+                            "status": "pending",
+                            "proof_required": _proof_required_for_type(obligation_type),
+                        }
+                        self.supabase.table("obligations").upsert(
+                            obligation_row,
+                            on_conflict="user_id,source,source_ref",
+                        ).execute()
+                    except Exception as e:
+                        # Do not fail the scan if obligations wiring is broken.
+                        logger.error("Failed to upsert obligation for email %s: %s", email.get("gmail_id"), e)
 
             except Exception as e:
                 logger.error(f"Error processing email {email['gmail_id']}: {e}")

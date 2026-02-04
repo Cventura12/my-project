@@ -53,6 +53,35 @@ export default function EmailsPage() {
     }
   };
 
+  const handleAttachConfirmationProof = async (email: AnalyzedEmail) => {
+    if (!user) return;
+
+    const obligationId = (prompt("Obligation ID to attach this email as proof:", "") || "").trim();
+    if (!obligationId) return;
+
+    if (!confirm("Attach this email as confirmation proof? This will NOT auto-verify.")) return;
+
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/obligations/${encodeURIComponent(obligationId)}/proofs/attach-confirmation-email`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ user_id: user.id, analyzed_email_id: email.id }),
+        }
+      );
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || "Attach proof failed");
+      }
+
+      alert("Proof attached. You still must verify the obligation manually.");
+    } catch (e: any) {
+      alert(e?.message || "Failed to attach proof");
+    }
+  };
+
   const filtered: AnalyzedEmail[] = emails.filter((e) => {
     if (filter === "actionable") return e.requires_action;
     if (filter === "high") return e.relevance === "high";
@@ -84,7 +113,7 @@ export default function EmailsPage() {
             <div>
               <h1 className="text-lg font-bold text-black">Email Monitor</h1>
               <p className="text-xs text-gray-400">
-                AI-analyzed emails for financial aid
+                Signals only - canonical deadlines live in Obligations
               </p>
             </div>
           </div>
@@ -201,7 +230,12 @@ export default function EmailsPage() {
         ) : (
           <div className="space-y-3">
             {filtered.map((email) => (
-              <EmailCard key={email.id} email={email} onDismiss={dismissEmail} />
+              <EmailCard
+                key={email.id}
+                email={email}
+                onDismiss={dismissEmail}
+                onAttachConfirmationProof={handleAttachConfirmationProof}
+              />
             ))}
           </div>
         )}
