@@ -3230,9 +3230,7 @@ def _extract_type_candidate(text: str) -> Optional[str]:
 def _extract_institution_candidate(text: str) -> Optional[str]:
     # Minimal heuristic: look for "School:" or "Institution:"
     import re
-    m = re.search(r'(School|Institution)\s*:\s*([^
-
-]+)', text, re.IGNORECASE)
+    m = re.search(r'(School|Institution)\s*:\s*([^\r\n]+)', text, re.IGNORECASE)
     if m:
         return m.group(2).strip()
     return None
@@ -3272,8 +3270,7 @@ def _ocr_text_from_bytes(blob: bytes, mime_type: str) -> str:
             from pypdf import PdfReader
             import io
             reader = PdfReader(io.BytesIO(blob))
-            return "
-".join([page.extract_text() or "" for page in reader.pages])
+            return "\n".join([page.extract_text() or "" for page in reader.pages])
         except Exception:
             return ""
     try:
