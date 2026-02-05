@@ -3169,6 +3169,11 @@ async def complete_obligation_step(obligation_id: str, step_id: str, user_id: st
             raise HTTPException(status_code=404, detail="Step not found")
         if step.get("status") == "completed":
             return {"status": "completed", "step_id": step_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Complete step error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ==================== PHASE 6: NON-COOPERATIVE INPUTS ====================
 
