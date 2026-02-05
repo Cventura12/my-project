@@ -19,7 +19,8 @@ logger = logging.getLogger(__name__)
 
 def get_gmail_redirect_uri() -> str:
     # Must match a redirect URI configured in Google Cloud Console for the OAuth client.
-    return os.getenv("GMAIL_REDIRECT_URI", "http://localhost:8000/oauth/gmail/callback")
+    backend_public_url = os.environ.get("BACKEND_PUBLIC_URL", "http://localhost:8000").rstrip("/")
+    return f"{backend_public_url}/oauth/gmail/callback"
 
 
 def load_gmail_oauth_credentials() -> Tuple[str, str]:
@@ -83,4 +84,3 @@ def _extract_client_id_secret(data: Dict[str, Any]) -> Tuple[str, str]:
     if not client_id or not client_secret:
         raise ValueError("Invalid Gmail OAuth credentials: missing client_id/client_secret")
     return client_id, client_secret
-

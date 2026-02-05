@@ -5428,6 +5428,8 @@ def _scan_all_connected_users():
 
 @app.on_event("startup")
 def _startup_jobs():
+    backend_public_url = os.environ.get("BACKEND_PUBLIC_URL", "http://localhost:8000")
+    logger.info("BACKEND_PUBLIC_URL=%s", backend_public_url)
     interval = int(os.getenv("EMAIL_SCAN_INTERVAL_MINUTES", "0") or "0")
     if interval <= 0:
         return
