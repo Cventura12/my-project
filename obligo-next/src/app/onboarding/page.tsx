@@ -69,7 +69,7 @@ export default function OnboardingPage() {
 
   // Step 1: profile
   const [fullName, setFullName] = useState("");
-  const [gradYear, setGradYear] = useState("");
+  const [graduationYear, setGraduationYear] = useState("");
   const [phone, setPhone] = useState("");
 
   // Step 2: schools
@@ -120,7 +120,7 @@ export default function OnboardingPage() {
   const canGoNext = useMemo(() => {
     if (step === 1) {
       if (!fullName.trim()) return false;
-      if (!isYear(gradYear)) return false;
+      if (!isYear(graduationYear)) return false;
       return true;
     }
     if (step === 2) {
@@ -131,7 +131,7 @@ export default function OnboardingPage() {
       return true;
     }
     return true;
-  }, [step, fullName, gradYear, schools.length, skipSchools]);
+  }, [step, fullName, graduationYear, schools.length, skipSchools]);
 
   const addSchool = (name: string) => {
     const trimmed = name.trim();
@@ -185,7 +185,7 @@ export default function OnboardingPage() {
           .from("profiles")
           .update({
             full_name: fullName.trim(),
-            grad_year: isYear(gradYear) ? Number(gradYear) : null,
+            graduation_year: isYear(graduationYear) ? Number(graduationYear) : null,
             phone: phone.trim() || null,
             onboarding_completed: true,
           })
@@ -369,12 +369,12 @@ export default function OnboardingPage() {
                         </label>
                         <input
                           inputMode="numeric"
-                          value={gradYear}
-                          onChange={(e) => setGradYear(e.target.value)}
+                          value={graduationYear}
+                          onChange={(e) => setGraduationYear(e.target.value)}
                           placeholder="e.g. 2026"
                           className={classNames(
                             "w-full rounded-xl border-2 px-3 py-2.5 text-sm focus:outline-none transition-colors",
-                            gradYear && !isYear(gradYear)
+                            graduationYear && !isYear(graduationYear)
                               ? "border-red-200 focus:border-red-400"
                               : "border-gray-200 focus:border-emerald-600"
                           )}
@@ -669,7 +669,7 @@ export default function OnboardingPage() {
                           Profile
                         </p>
                         <p className="mt-1 text-gray-900 font-medium">{fullName || "—"}</p>
-                        <p className="mt-1 text-gray-500">Grad year: {gradYear || "—"}</p>
+                        <p className="mt-1 text-gray-500">Grad year: {graduationYear || "—"}</p>
                         <p className="mt-1 text-gray-500">Phone: {phone.trim() ? phone : "—"}</p>
                       </div>
                       <div>
