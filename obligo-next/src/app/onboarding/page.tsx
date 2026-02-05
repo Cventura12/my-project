@@ -203,7 +203,7 @@ export default function OnboardingPage() {
           // Phase 1 doctrine: deadlines are canonical only in `obligations`.
           application_deadline: null,
           financial_aid_deadline: null,
-          status: "tracking",
+          status: "applying",
         }));
 
         const { data: insertedSchools, error: schoolsError } = await supabase
