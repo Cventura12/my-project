@@ -399,7 +399,7 @@ def _verify_oauth_state(state: str, max_age_seconds: int = 10 * 60) -> Dict[str,
 
 def get_gmail_auth_url(state: Optional[str] = None) -> str:
     """Generate Gmail OAuth authorization URL for web flow."""
-    import urllib.parse
+    from starlette.datastructures import URL
     from backend.google_oauth import load_gmail_oauth_credentials, get_gmail_redirect_uri
 
     client_id, _client_secret = load_gmail_oauth_credentials()
@@ -417,7 +417,8 @@ def get_gmail_auth_url(state: Optional[str] = None) -> str:
     if state:
         params["state"] = state
 
-    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
+    logger.info("Gmail OAuth redirect_uri=%r params.redirect_uri=%r", redirect_uri, params["redirect_uri"])
+    auth_url = str(URL("https://accounts.google.com/o/oauth2/v2/auth").include_query_params(**params))
     logger.info("Generated Gmail OAuth URL")
     return auth_url
 
