@@ -278,7 +278,9 @@ create table if not exists obligations (
     'APPLICATION_FEE',
     'APPLICATION_SUBMISSION',
     'HOUSING_DEPOSIT',
-    'SCHOLARSHIP'
+    'SCHOLARSHIP',
+    'ENROLLMENT_DEPOSIT',
+    'SCHOLARSHIP_ACCEPTANCE'
   )),
 
   -- Human readable
@@ -293,19 +295,26 @@ create table if not exists obligations (
   deadline timestamptz,
 
   -- Canonical status. Keep minimal; do not add workflow states yet.
-  status text not null default 'pending' check (status in ('pending', 'submitted', 'verified', 'blocked')),
+  status text not null default 'pending' check (status in ('pending', 'submitted', 'verified', 'blocked', 'failed')),
 
   -- Whether verification requires proof. Proof storage is out of scope for Phase 1 spine.
   proof_required boolean not null default false,
 
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
+  -- Phase 3 Step 4: Memory of consequence
+  failed_at timestamptz,
+  verified_at timestamptz,
+  prior_failed_obligation_id uuid references obligations(id),
   constraint obligations_source_ref_unique unique (user_id, source, source_ref)
 );
 
 -- Phase 1 Step 4: submitted_at is required to detect "unverified after submission" states server-side.
 -- This is NOT a workflow system; it's a minimal timestamp for controlled recovery drafts.
 alter table obligations add column if not exists submitted_at timestamptz;
+alter table obligations add column if not exists failed_at timestamptz;
+alter table obligations add column if not exists verified_at timestamptz;
+alter table obligations add column if not exists prior_failed_obligation_id uuid references obligations(id);
 
 -- Phase 1 Step 3: remove legacy spine constraint if it exists (proof is now modeled explicitly).
 alter table obligations drop constraint if exists obligations_verified_requires_proof;
@@ -355,6 +364,55 @@ create trigger obligations_set_submitted_at
   for each row execute function set_obligation_submitted_at();
 
 create index if not exists idx_obligations_submitted_at on obligations(user_id, submitted_at) where status = 'submitted';
+
+-- Phase 3 Step 4: Irreversible terminal states (failed, verified)
+create or replace function enforce_obligation_irreversible_states()
+returns trigger as $$
+begin
+  if old.status in ('failed', 'verified') and new.status is distinct from old.status then
+    raise exception 'Irreversible: status % cannot transition to %.', old.status, new.status;
+  end if;
+
+  -- Preserve failure record fields
+  if old.status = 'failed' then
+    if new.deadline is distinct from old.deadline then
+      raise exception 'Irreversible: failed obligation deadline cannot change.';
+    end if;
+    if new.proof_required is distinct from old.proof_required then
+      raise exception 'Irreversible: failed obligation proof state cannot change.';
+    end if;
+  end if;
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists obligations_enforce_irreversible on obligations;
+create trigger obligations_enforce_irreversible
+  before update on obligations
+  for each row execute function enforce_obligation_irreversible_states();
+
+-- Phase 3 Step 4: Terminal timestamps
+create or replace function set_obligation_terminal_timestamps()
+returns trigger as $$
+begin
+  if new.status = 'failed' then
+    if old.status is distinct from 'failed' then
+      new.failed_at = now();
+    end if;
+  end if;
+  if new.status = 'verified' then
+    if old.status is distinct from 'verified' then
+      new.verified_at = now();
+    end if;
+  end if;
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists obligations_set_terminal_timestamps on obligations;
+create trigger obligations_set_terminal_timestamps
+  before update on obligations
+  for each row execute function set_obligation_terminal_timestamps();
 
 -- ==========================================
 -- Phase 1 Step 4: Obligation-linked follow-up drafts (controlled automation)
@@ -515,7 +573,7 @@ create trigger obligation_proofs_validate_confirmation_email
 -- If there is doubt, block. That is the rule.
 
 -- Extend obligation types to support dependency graph nodes.
--- New types: ACCEPTANCE, SCHOLARSHIP_DISBURSEMENT, ENROLLMENT
+-- New types: ACCEPTANCE, SCHOLARSHIP_DISBURSEMENT, ENROLLMENT, ENROLLMENT_DEPOSIT, SCHOLARSHIP_ACCEPTANCE
 -- Existing types remain unchanged for backwards compatibility.
 alter table obligations drop constraint if exists obligations_type_check;
 alter table obligations add constraint obligations_type_check
@@ -527,7 +585,9 @@ alter table obligations add constraint obligations_type_check
     'SCHOLARSHIP',
     'ACCEPTANCE',
     'SCHOLARSHIP_DISBURSEMENT',
-    'ENROLLMENT'
+    'ENROLLMENT',
+    'ENROLLMENT_DEPOSIT',
+    'SCHOLARSHIP_ACCEPTANCE'
   ));
 
 -- Obligation dependencies: explicit edges between obligation instances.
@@ -811,6 +871,209 @@ create index if not exists idx_obligations_severity on obligations(user_id, seve
   where severity in ('high', 'critical', 'failed');
 
 
+-- ==========================================
+-- 14. Phase 3 Step 4: Obligation History (append-only)
+-- ==========================================
+-- Records irreversible changes and severity evolution.
+-- No deletes. No updates. Append-only audit.
+create table if not exists obligation_history (
+  id uuid default gen_random_uuid() primary key,
+  obligation_id uuid references obligations(id) on delete cascade not null,
+  user_id uuid references auth.users on delete cascade not null,
+  event_type text not null check (event_type in ('status_change', 'severity_change', 'reattempt_created', 'propagation_unblocked')),
+  prev_status text,
+  new_status text,
+  prev_severity text,
+  new_severity text,
+  reason text,
+  actor_user_id uuid references auth.users,
+  created_at timestamptz not null default now()
+);
+
+create index if not exists idx_obligation_history_obligation on obligation_history(obligation_id, created_at);
+
+alter table obligation_history enable row level security;
+
+create policy "Users can view own obligation history"
+  on obligation_history for select using (auth.uid() = user_id);
+
+create policy "Users can insert own obligation history"
+  on obligation_history for insert with check (auth.uid() = user_id);
+
+create or replace function log_obligation_status_change()
+returns trigger as $$
+begin
+  if new.status is distinct from old.status then
+    insert into obligation_history (
+      obligation_id, user_id, event_type,
+      prev_status, new_status, reason, actor_user_id
+    ) values (
+      new.id, new.user_id, 'status_change',
+      old.status, new.status,
+      case
+        when new.status = 'failed' then 'deadline_passed'
+        when new.status = 'verified' then 'verified'
+        else null
+      end,
+      auth.uid()
+    );
+  end if;
+  return new;
+end;
+$$ language plpgsql;
+
+create or replace function log_obligation_severity_change()
+returns trigger as $$
+begin
+  if new.severity is distinct from old.severity then
+    insert into obligation_history (
+      obligation_id, user_id, event_type,
+      prev_severity, new_severity, reason, actor_user_id
+    ) values (
+      new.id, new.user_id, 'severity_change',
+      old.severity, new.severity, new.severity_reason, auth.uid()
+    );
+  end if;
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists obligations_log_status_change on obligations;
+create trigger obligations_log_status_change
+  after update on obligations
+  for each row execute function log_obligation_status_change();
+
+drop trigger if exists obligations_log_severity_change on obligations;
+create trigger obligations_log_severity_change
+  after update on obligations
+  for each row execute function log_obligation_severity_change();
+
+
+-- ==========================================
+-- 15. Phase 4 Step 1: Obligation Steps (FAFSA + SCHOLARSHIP only)
+-- ==========================================
+create table if not exists obligation_steps (
+  id uuid default gen_random_uuid() primary key,
+  obligation_id uuid references obligations(id) on delete cascade not null,
+  user_id uuid references auth.users on delete cascade not null,
+  step_type text not null check (step_type in (
+    'FAFSA_SUBMITTED',
+    'FAFSA_PROCESSED',
+    'SCHOOL_RECEIVED',
+    'APPLICATION_SUBMITTED',
+    'ACCEPTANCE_CONFIRMED'
+  )),
+  status text not null default 'pending' check (status in ('pending', 'completed', 'blocked')),
+  created_at timestamptz not null default now(),
+  completed_at timestamptz
+);
+
+create index if not exists idx_obligation_steps_obligation on obligation_steps(obligation_id, created_at);
+
+alter table obligation_steps enable row level security;
+
+create policy "Users can view own obligation steps"
+  on obligation_steps for select using (auth.uid() = user_id);
+
+create policy "Users can insert own obligation steps"
+  on obligation_steps for insert with check (auth.uid() = user_id);
+
+create policy "Users can update own obligation steps"
+  on obligation_steps for update using (auth.uid() = user_id);
+
+-- Create steps lazily on next write for FAFSA/SCHOLARSHIP only.
+create or replace function ensure_obligation_steps()
+returns trigger as $$
+declare
+  step_count int;
+begin
+  if new.type not in ('FAFSA', 'SCHOLARSHIP') then
+    return new;
+  end if;
+
+  select count(*) into step_count
+  from obligation_steps
+  where obligation_id = new.id;
+
+  if step_count = 0 then
+    if new.type = 'FAFSA' then
+      insert into obligation_steps (obligation_id, user_id, step_type, status)
+      values
+        (new.id, new.user_id, 'FAFSA_SUBMITTED', 'pending'),
+        (new.id, new.user_id, 'FAFSA_PROCESSED', 'pending'),
+        (new.id, new.user_id, 'SCHOOL_RECEIVED', 'pending');
+    elsif new.type = 'SCHOLARSHIP' then
+      insert into obligation_steps (obligation_id, user_id, step_type, status)
+      values
+        (new.id, new.user_id, 'APPLICATION_SUBMITTED', 'pending'),
+        (new.id, new.user_id, 'ACCEPTANCE_CONFIRMED', 'pending');
+    end if;
+  end if;
+
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists obligations_ensure_steps on obligations;
+create trigger obligations_ensure_steps
+  after insert or update on obligations
+  for each row execute function ensure_obligation_steps();
+
+-- Enforce step order: only the next pending step can be completed.
+create or replace function enforce_step_order()
+returns trigger as $$
+declare
+  earliest_pending uuid;
+begin
+  if new.status = 'completed' and old.status is distinct from 'completed' then
+    select id into earliest_pending
+    from obligation_steps
+    where obligation_id = new.obligation_id
+      and status = 'pending'
+    order by created_at asc
+    limit 1;
+
+    if earliest_pending is not null and earliest_pending != new.id then
+      raise exception 'Out of order: complete the next pending step first.';
+    end if;
+
+    new.completed_at = now();
+  end if;
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists obligation_steps_enforce_order on obligation_steps;
+create trigger obligation_steps_enforce_order
+  before update on obligation_steps
+  for each row execute function enforce_step_order();
+
+-- Block verification if any required steps remain incomplete.
+create or replace function enforce_steps_before_verification()
+returns trigger as $$
+declare
+  incomplete_count int;
+begin
+  if new.status = 'verified' and new.type in ('FAFSA', 'SCHOLARSHIP') then
+    select count(*) into incomplete_count
+    from obligation_steps
+    where obligation_id = new.id
+      and status != 'completed';
+
+    if incomplete_count > 0 then
+      raise exception 'Blocked: all required steps must be completed before verification.';
+    end if;
+  end if;
+  return new;
+end;
+$$ language plpgsql;
+
+drop trigger if exists obligations_enforce_steps_verification on obligations;
+create trigger obligations_enforce_steps_verification
+  before update on obligations
+  for each row execute function enforce_steps_before_verification();
+
+
 -- Update the dependency enforcement trigger to respect overrides.
 -- A dependency is "met" if EITHER:
 --   (a) the dependency obligation has status = 'verified', OR
@@ -845,3 +1108,101 @@ begin
   return new;
 end;
 $$ language plpgsql;
+
+
+-- ==========================================
+-- 16. Phase 6: Non-Cooperative Inputs (minimal)
+-- ==========================================
+create table if not exists uploads (
+  id uuid default gen_random_uuid() primary key,
+  user_id uuid references auth.users on delete cascade not null,
+  bucket text not null,
+  path text not null,
+  mime_type text,
+  size_bytes bigint,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists intake_items (
+  id uuid default gen_random_uuid() primary key,
+  user_id uuid references auth.users on delete cascade not null,
+  source text not null check (source in ('portal_paste', 'screenshot', 'pdf')),
+  raw_text text,
+  upload_id uuid references uploads on delete set null,
+  status text not null default 'pending' check (status in ('pending', 'extracted', 'confirmed', 'discarded', 'error')),
+  created_at timestamptz not null default now()
+);
+
+create table if not exists intake_extractions (
+  id uuid default gen_random_uuid() primary key,
+  intake_item_id uuid references intake_items on delete cascade not null,
+  obligation_type_candidate text,
+  institution_candidate text,
+  deadline_candidate text,
+  confidence numeric,
+  fields jsonb,
+  created_at timestamptz not null default now()
+);
+
+alter table uploads enable row level security;
+alter table intake_items enable row level security;
+alter table intake_extractions enable row level security;
+
+create policy "Users can view own uploads"
+  on uploads for select using (auth.uid() = user_id);
+create policy "Users can insert own uploads"
+  on uploads for insert with check (auth.uid() = user_id);
+create policy "Users can update own uploads"
+  on uploads for update using (auth.uid() = user_id);
+
+create policy "Users can view own intake items"
+  on intake_items for select using (auth.uid() = user_id);
+create policy "Users can insert own intake items"
+  on intake_items for insert with check (auth.uid() = user_id);
+create policy "Users can update own intake items"
+  on intake_items for update using (auth.uid() = user_id);
+
+create policy "Users can view own intake extractions"
+  on intake_extractions for select using (
+    exists (select 1 from intake_items i where i.id = intake_extractions.intake_item_id and i.user_id = auth.uid())
+  );
+create policy "Users can insert own intake extractions"
+  on intake_extractions for insert with check (
+    exists (select 1 from intake_items i where i.id = intake_extractions.intake_item_id and i.user_id = auth.uid())
+  );
+
+-- Storage buckets (proofs, intake)
+insert into storage.buckets (id, name, public)
+values ('proofs', 'proofs', false)
+on conflict do nothing;
+
+insert into storage.buckets (id, name, public)
+values ('intake', 'intake', false)
+on conflict do nothing;
+
+-- Storage policies: users can read/write under their own prefix
+create policy "proofs_read_own"
+  on storage.objects for select
+  using (bucket_id = 'proofs' and auth.uid()::text = split_part(name, '/', 1));
+create policy "proofs_write_own"
+  on storage.objects for insert
+  with check (bucket_id = 'proofs' and auth.uid()::text = split_part(name, '/', 1));
+create policy "proofs_update_own"
+  on storage.objects for update
+  using (bucket_id = 'proofs' and auth.uid()::text = split_part(name, '/', 1));
+create policy "proofs_delete_own"
+  on storage.objects for delete
+  using (bucket_id = 'proofs' and auth.uid()::text = split_part(name, '/', 1));
+
+create policy "intake_read_own"
+  on storage.objects for select
+  using (bucket_id = 'intake' and auth.uid()::text = split_part(name, '/', 1));
+create policy "intake_write_own"
+  on storage.objects for insert
+  with check (bucket_id = 'intake' and auth.uid()::text = split_part(name, '/', 1));
+create policy "intake_update_own"
+  on storage.objects for update
+  using (bucket_id = 'intake' and auth.uid()::text = split_part(name, '/', 1));
+create policy "intake_delete_own"
+  on storage.objects for delete
+  using (bucket_id = 'intake' and auth.uid()::text = split_part(name, '/', 1));

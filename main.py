@@ -2794,7 +2794,116 @@ async def list_obligations(user_id: str, status: Optional[str] = None, limit: in
             query = query.eq("status", status)
 
         result = query.execute()
-        return {"obligations": result.data or [], "count": len(result.data or [])}
+        obligations = result.data or []
+        if not obligations:
+            return {"obligations": [], "count": 0}
+
+        # Ensure dependency edges exist (deterministic rules only)
+        by_school: dict[str, list[dict]] = {}
+        for obl in obligations:
+            ctx = _extract_school_context(obl.get("source_ref", ""))
+            key = ctx or "__no_school__"
+            by_school.setdefault(key, []).append(obl)
+
+        by_school_type: dict[str, dict[str, list[dict]]] = {}
+        for school_key, obls in by_school.items():
+            by_school_type[school_key] = {}
+            for obl in obls:
+                by_school_type[school_key].setdefault(obl["type"], []).append(obl)
+
+        obl_ids = [o["id"] for o in obligations]
+        existing_deps_res = sb.table("obligation_dependencies") \
+            .select("*") \
+            .in_("obligation_id", obl_ids) \
+            .execute()
+        existing_deps = existing_deps_res.data or []
+        existing_edges = {(d["obligation_id"], d["depends_on_obligation_id"]) for d in existing_deps}
+
+        edges_to_create = []
+        for obl in obligations:
+            required_types = _required_types_for_obligation(obl, by_school_type)
+            if not required_types:
+                continue
+            school_key = _extract_school_context(obl.get("source_ref", "")) or "__no_school__"
+            for req_type in required_types:
+                candidates = by_school_type.get(school_key, {}).get(req_type, [])
+                if not candidates and school_key != "__no_school__":
+                    candidates = by_school_type.get("__no_school__", {}).get(req_type, [])
+                for prereq in candidates:
+                    edge = (obl["id"], prereq["id"])
+                    if edge not in existing_edges:
+                        edges_to_create.append({
+                            "obligation_id": obl["id"],
+                            "depends_on_obligation_id": prereq["id"],
+                        })
+                        existing_edges.add(edge)
+
+        if edges_to_create:
+            try:
+                sb.table("obligation_dependencies").insert(edges_to_create).execute()
+            except Exception as e:
+                logger.warning(f"Some dependency edges may already exist (OK): {e}")
+
+        obl_ids = [o["id"] for o in obligations]
+
+        deps_res = sb.table("obligation_dependencies") \
+            .select("obligation_id, depends_on_obligation_id") \
+            .in_("obligation_id", obl_ids) \
+            .execute()
+        all_deps = deps_res.data or []
+
+        overrides_res = sb.table("obligation_overrides") \
+            .select("obligation_id, overridden_dependency_id, user_reason, created_at") \
+            .in_("obligation_id", obl_ids) \
+            .execute()
+        all_overrides = overrides_res.data or []
+
+        override_set: set[tuple[str, str]] = set()
+        override_details: dict[str, list[dict]] = {}
+        for ov in all_overrides:
+            override_set.add((ov["obligation_id"], ov["overridden_dependency_id"]))
+            override_details.setdefault(ov["obligation_id"], []).append(ov)
+
+        dep_map: dict[str, list[str]] = {}
+        for d in all_deps:
+            dep_map.setdefault(d["obligation_id"], []).append(d["depends_on_obligation_id"])
+
+        obl_by_id = {o["id"]: o for o in obligations}
+
+        enriched = []
+        for obl in obligations:
+            deps = dep_map.get(obl["id"], [])
+            blockers = []
+            overridden_deps = []
+            for dep_id in deps:
+                dep_obl = obl_by_id.get(dep_id)
+                if not dep_obl:
+                    continue
+                if dep_obl["status"] == "verified":
+                    continue
+                edge = (obl["id"], dep_id)
+                if edge in override_set:
+                    override_record = next(
+                        (ov for ov in override_details.get(obl["id"], [])
+                         if ov.get("overridden_dependency_id") == dep_id),
+                        None,
+                    )
+                    overridden_deps.append({
+                        **_blocker_payload(dep_obl),
+                        "created_at": override_record.get("created_at") if override_record else None,
+                    })
+                else:
+                    blockers.append(_blocker_payload(dep_obl))
+
+            is_blocked = len(blockers) > 0
+            enriched.append({
+                **obl,
+                "is_blocked": is_blocked,
+                "blocked_by": blockers,
+                "overridden_deps": overridden_deps,
+            })
+
+        return {"obligations": enriched, "count": len(enriched)}
     except Exception as e:
         logger.error(f"Obligations list error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -2802,7 +2911,7 @@ async def list_obligations(user_id: str, status: Optional[str] = None, limit: in
 
 class ObligationStatusUpdateRequest(BaseModel):
     user_id: str
-    status: str  # pending | submitted | verified | blocked
+    status: str  # pending | submitted | verified | blocked | failed
 
 
 class ObligationProofCreateRequest(BaseModel):
@@ -2816,7 +2925,7 @@ class AttachConfirmationEmailProofRequest(BaseModel):
     analyzed_email_id: str  # analyzed_emails.id (NOT gmail_id)
 
 
-_OBLIGATION_STATUSES = {"pending", "submitted", "verified", "blocked"}
+_OBLIGATION_STATUSES = {"pending", "submitted", "verified", "blocked", "failed"}
 _PROOF_TYPES = {"receipt", "confirmation_email", "portal_screenshot", "file_upload"}
 
 
@@ -2871,6 +2980,27 @@ async def update_obligation_status(obligation_id: str, request: ObligationStatus
         obligation = getattr(obligation_res, "data", None)
         if not obligation:
             raise HTTPException(status_code=404, detail="Obligation not found")
+
+        # Phase 3 Step 4: Irreversible transitions
+        if obligation.get("status") in ("failed", "verified") and request.status != obligation.get("status"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Irreversible: {obligation.get('status')} obligations cannot change status.",
+            )
+
+        # Phase 3 Step 4: Failure can only be recorded after deadline passed
+        if request.status == "failed":
+            if obligation.get("status") == "verified":
+                raise HTTPException(status_code=409, detail="Irreversible: verified obligations cannot fail.")
+            deadline = obligation.get("deadline")
+            if not deadline:
+                raise HTTPException(status_code=409, detail="Cannot mark failed without a deadline.")
+            try:
+                deadline_dt = datetime.fromisoformat(deadline.replace("Z", "+00:00")).replace(tzinfo=None)
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid deadline format.")
+            if deadline_dt >= datetime.utcnow():
+                raise HTTPException(status_code=409, detail="Cannot mark failed before deadline passes.")
 
         # Phase 2 Step 1 & 3: Dependency-gated transitions.
         # Cannot transition to submitted or verified if any dependency is unmet.
@@ -2935,6 +3065,21 @@ async def update_obligation_status(obligation_id: str, request: ObligationStatus
                     detail="Blocked: proof is required to verify this obligation. Attach proof first.",
                 )
 
+        # Phase 4 Step 1: Steps gating for FAFSA/SCHOLARSHIP
+        if request.status == "verified" and obligation.get("type") in ("FAFSA", "SCHOLARSHIP"):
+            steps_res = sb.table("obligation_steps") \
+                .select("id, status") \
+                .eq("obligation_id", obligation_id) \
+                .execute()
+            steps = steps_res.data or []
+            if steps:
+                incomplete = [s for s in steps if s["status"] != "completed"]
+                if incomplete:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Blocked: all required steps must be completed before verification.",
+                    )
+
         # Update (DB triggers also enforce proof-gating and dependency-gating as safety nets)
         updated_res = sb.table("obligations") \
             .update({"status": request.status}) \
@@ -2948,11 +3093,522 @@ async def update_obligation_status(obligation_id: str, request: ObligationStatus
         if not updated:
             raise HTTPException(status_code=500, detail="Failed to update obligation")
 
+        # Phase 4 Step 3: Controlled propagation (unblock only)
+        if request.status == "verified":
+            _propagate_unblock(sb, updated)
+
         return {"status": "updated", "obligation": updated}
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Obligation status update error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/obligations/{obligation_id}/steps")
+async def get_obligation_steps(obligation_id: str, user_id: str):
+    """
+    List ordered steps for an obligation.
+    """
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        # Ownership check
+        obl_res = sb.table("obligations") \
+            .select("id, type") \
+            .eq("id", obligation_id) \
+            .eq("user_id", user_id) \
+            .single() \
+            .execute()
+        if not getattr(obl_res, "data", None):
+            raise HTTPException(status_code=404, detail="Obligation not found")
+
+        steps_res = sb.table("obligation_steps") \
+            .select("*") \
+            .eq("obligation_id", obligation_id) \
+            .order("created_at", desc=False) \
+            .execute()
+
+        return {"steps": steps_res.data or [], "count": len(steps_res.data or [])}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get steps error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/obligations/{obligation_id}/steps/{step_id}/complete")
+async def complete_obligation_step(obligation_id: str, step_id: str, user_id: str):
+    """
+    Mark a step as completed. Enforces strict order (next pending only).
+    """
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        # Ownership check
+        obl_res = sb.table("obligations") \
+            .select("id") \
+            .eq("id", obligation_id) \
+            .eq("user_id", user_id) \
+            .single() \
+            .execute()
+        if not getattr(obl_res, "data", None):
+            raise HTTPException(status_code=404, detail="Obligation not found")
+
+        # Ensure the step belongs to the obligation
+        step_res = sb.table("obligation_steps") \
+            .select("id, status") \
+            .eq("id", step_id) \
+            .eq("obligation_id", obligation_id) \
+            .single() \
+            .execute()
+        step = getattr(step_res, "data", None)
+        if not step:
+            raise HTTPException(status_code=404, detail="Step not found")
+        if step.get("status") == "completed":
+            return {"status": "completed", "step_id": step_id}
+
+# ==================== PHASE 6: NON-COOPERATIVE INPUTS ====================
+
+class IntakePortalPasteRequest(BaseModel):
+    user_id: str
+    raw_text: str
+
+class IntakeCreateRequest(BaseModel):
+    user_id: str
+    source: str  # portal_paste | screenshot | pdf
+
+class IntakeOcrRequest(BaseModel):
+    user_id: str
+    bucket: str
+    path: str
+    upload_id: Optional[str] = None
+    source: str  # screenshot | pdf
+
+class IntakeConfirmRequest(BaseModel):
+    user_id: str
+    existing_obligation_id: Optional[str] = None
+
+
+def _extract_deadline_candidate(text: str) -> Optional[str]:
+    # Simple date patterns: YYYY-MM-DD or Month Day, Year
+    import re
+    m = re.search(r'(\d{4}-\d{2}-\d{2})', text)
+    if m:
+        return m.group(1)
+    m = re.search(r'([A-Za-z]+\s+\d{1,2},\s+\d{4})', text)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _extract_type_candidate(text: str) -> Optional[str]:
+    t = text.lower()
+    if 'fafsa' in t:
+        return 'FAFSA'
+    if 'application fee' in t:
+        return 'APPLICATION_FEE'
+    if 'application submission' in t or 'submit application' in t:
+        return 'APPLICATION_SUBMISSION'
+    if 'housing deposit' in t:
+        return 'HOUSING_DEPOSIT'
+    if 'enrollment deposit' in t:
+        return 'ENROLLMENT_DEPOSIT'
+    if 'scholarship acceptance' in t:
+        return 'SCHOLARSHIP_ACCEPTANCE'
+    if 'scholarship' in t:
+        return 'SCHOLARSHIP'
+    if 'acceptance' in t:
+        return 'ACCEPTANCE'
+    if 'enrollment' in t:
+        return 'ENROLLMENT'
+    return None
+
+
+def _extract_institution_candidate(text: str) -> Optional[str]:
+    # Minimal heuristic: look for "School:" or "Institution:"
+    import re
+    m = re.search(r'(School|Institution)\s*:\s*([^
+
+]+)', text, re.IGNORECASE)
+    if m:
+        return m.group(2).strip()
+    return None
+
+
+def _extract_candidates(raw_text: str) -> dict:
+    deadline = _extract_deadline_candidate(raw_text)
+    obl_type = _extract_type_candidate(raw_text)
+    institution = _extract_institution_candidate(raw_text)
+    confidence = 0.2
+    if obl_type:
+        confidence += 0.3
+    if deadline:
+        confidence += 0.3
+    if institution:
+        confidence += 0.2
+    if confidence > 0.95:
+        confidence = 0.95
+    return {
+        "obligation_type_candidate": obl_type,
+        "institution_candidate": institution,
+        "deadline_candidate": deadline,
+        "confidence": confidence,
+        "fields": {
+            "raw_text": raw_text[:2000],
+        }
+    }
+
+
+def _download_storage_file(sb, bucket: str, path: str) -> bytes:
+    return sb.storage.from_(bucket).download(path)
+
+
+def _ocr_text_from_bytes(blob: bytes, mime_type: str) -> str:
+    if mime_type == 'application/pdf':
+        try:
+            from pypdf import PdfReader
+            import io
+            reader = PdfReader(io.BytesIO(blob))
+            return "
+".join([page.extract_text() or "" for page in reader.pages])
+        except Exception:
+            return ""
+    try:
+        from PIL import Image
+        import pytesseract
+        import io
+        img = Image.open(io.BytesIO(blob))
+        return pytesseract.image_to_string(img)
+    except Exception:
+        return ""
+
+
+@app.post("/api/intake/portal-paste")
+async def intake_portal_paste(req: IntakePortalPasteRequest):
+    """Create intake item from pasted portal text and extract candidates."""
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        item_res = sb.table("intake_items").insert({
+            "user_id": req.user_id,
+            "source": "portal_paste",
+            "raw_text": req.raw_text,
+            "status": "pending",
+        }).select("*").single().execute()
+        item = getattr(item_res, "data", None)
+        if not item:
+            raise HTTPException(status_code=500, detail="Failed to create intake item")
+
+        extraction = _extract_candidates(req.raw_text)
+        sb.table("intake_extractions").insert({
+            "intake_item_id": item["id"],
+            **extraction,
+        }).execute()
+        sb.table("intake_items").update({"status": "extracted"}).eq("id", item["id"]).execute()
+
+        return {"intake_item": item, "extraction": extraction}
+    except Exception as e:
+        logger.error(f"Portal paste intake error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/intake/create")
+async def intake_create(req: IntakeCreateRequest):
+    """Create intake item placeholder (for uploads)."""
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+        if req.source not in ("screenshot", "pdf"):
+            raise HTTPException(status_code=400, detail="Invalid source")
+
+        item_res = sb.table("intake_items").insert({
+            "user_id": req.user_id,
+            "source": req.source,
+            "status": "pending",
+        }).select("*").single().execute()
+        item = getattr(item_res, "data", None)
+        if not item:
+            raise HTTPException(status_code=500, detail="Failed to create intake item")
+        return {"intake_item": item}
+    except Exception as e:
+        logger.error(f"Intake create error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/intake/{intake_item_id}/ocr")
+async def intake_ocr(intake_item_id: str, req: IntakeOcrRequest):
+    """Run OCR on an uploaded file and extract candidates."""
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        item_res = sb.table("intake_items").select("*").eq("id", intake_item_id).eq("user_id", req.user_id).single().execute()
+        item = getattr(item_res, "data", None)
+        if not item:
+            raise HTTPException(status_code=404, detail="Intake item not found")
+
+        blob = _download_storage_file(sb, req.bucket, req.path)
+        mime_type = "application/pdf" if req.source == "pdf" else "image"
+        text = _ocr_text_from_bytes(blob, mime_type)
+        if not text:
+            sb.table("intake_items").update({"status": "error"}).eq("id", intake_item_id).execute()
+            raise HTTPException(status_code=422, detail="OCR produced no text")
+
+        sb.table("intake_items").update({
+            "raw_text": text,
+            "upload_id": req.upload_id,
+            "status": "extracted",
+        }).eq("id", intake_item_id).execute()
+
+        extraction = _extract_candidates(text)
+        sb.table("intake_extractions").insert({
+            "intake_item_id": intake_item_id,
+            **extraction,
+        }).execute()
+
+        return {"intake_item_id": intake_item_id, "extraction": extraction}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Intake OCR error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/intake/{intake_item_id}/confirm")
+async def intake_confirm(intake_item_id: str, req: IntakeConfirmRequest):
+    """Confirm extraction: create or link obligation. No auto-create without confirmation."""
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        item_res = sb.table("intake_items").select("*").eq("id", intake_item_id).eq("user_id", req.user_id).single().execute()
+        item = getattr(item_res, "data", None)
+        if not item:
+            raise HTTPException(status_code=404, detail="Intake item not found")
+
+        ext_res = sb.table("intake_extractions").select("*").eq("intake_item_id", intake_item_id).order("created_at", desc=True).limit(1).execute()
+        ext = (ext_res.data or [None])[0]
+        if not ext:
+            raise HTTPException(status_code=404, detail="No extraction found")
+
+        cand_type = ext.get("obligation_type_candidate")
+        if not cand_type or cand_type not in _OBLIGATION_TYPES:
+            raise HTTPException(status_code=400, detail="Insufficient obligation type candidate")
+
+        deadline = ext.get("deadline_candidate")
+        institution = ext.get("institution_candidate")
+
+        target_obl = None
+        if req.existing_obligation_id:
+            target_res = sb.table("obligations").select("*").eq("id", req.existing_obligation_id).eq("user_id", req.user_id).single().execute()
+            target_obl = getattr(target_res, "data", None)
+            if not target_obl:
+                raise HTTPException(status_code=404, detail="Existing obligation not found")
+        else:
+            # Deduplicate by type + deadline window (+ optional institution in title)
+            query = sb.table("obligations").select("*").eq("user_id", req.user_id).eq("type", cand_type)
+            candidates = query.execute().data or []
+            matches = []
+            for o in candidates:
+                if institution and institution.lower() not in (o.get("title", "").lower()):
+                    continue
+                if deadline and o.get("deadline"):
+                    # simple window: +/- 30 days on date string
+                    matches.append(o)
+                elif deadline is None:
+                    matches.append(o)
+            if matches:
+                target_obl = matches[0]
+
+        if not target_obl:
+            title = institution + " - " + cand_type if institution else cand_type
+            insert_payload = {
+                "user_id": req.user_id,
+                "type": cand_type,
+                "title": title,
+                "source": "manual",
+                "source_ref": f"intake:{intake_item_id}",
+                "deadline": deadline,
+                "status": "pending",
+                "proof_required": False,
+            }
+            new_res = sb.table("obligations").insert(insert_payload).select("*").single().execute()
+            target_obl = getattr(new_res, "data", None)
+
+        # Link upload as evidence if present
+        if item.get("upload_id"):
+            upload_res = sb.table("uploads").select("*").eq("id", item.get("upload_id")).single().execute()
+            upload = getattr(upload_res, "data", None)
+            if upload:
+                sb.table("obligation_proofs").insert({
+                    "obligation_id": target_obl["id"],
+                    "type": "portal_screenshot",
+                    "source_ref": upload.get("path"),
+                }).execute()
+
+        sb.table("intake_items").update({"status": "confirmed"}).eq("id", intake_item_id).execute()
+        return {"status": "confirmed", "obligation": target_obl}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Intake confirm error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/intake/{intake_item_id}/discard")
+async def intake_discard(intake_item_id: str, user_id: str):
+    """Discard intake item."""
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+        sb.table("intake_items").update({"status": "discarded"}).eq("id", intake_item_id).eq("user_id", user_id).execute()
+        return {"status": "discarded"}
+    except Exception as e:
+        logger.error(f"Intake discard error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+        # Enforce order: only earliest pending step can be completed
+        pending_res = sb.table("obligation_steps") \
+            .select("id") \
+            .eq("obligation_id", obligation_id) \
+            .eq("status", "pending") \
+            .order("created_at", desc=False) \
+            .limit(1) \
+            .execute()
+        pending = pending_res.data or []
+        if pending and pending[0]["id"] != step_id:
+            raise HTTPException(status_code=409, detail="Out of order: complete the next pending step first.")
+
+        updated_res = sb.table("obligation_steps") \
+            .update({"status": "completed", "completed_at": datetime.utcnow().isoformat()}) \
+            .eq("id", step_id) \
+            .eq("obligation_id", obligation_id) \
+            .select("*") \
+            .single() \
+            .execute()
+        updated = getattr(updated_res, "data", None)
+        if not updated:
+            raise HTTPException(status_code=500, detail="Failed to complete step")
+
+        return {"status": "completed", "step": updated}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Complete step error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class ObligationReattemptRequest(BaseModel):
+    user_id: str
+    new_deadline: Optional[str] = None  # ISO date or timestamp
+    title: Optional[str] = None
+
+
+@app.post("/api/obligations/{obligation_id}/reattempt")
+async def reattempt_obligation(obligation_id: str, request: ObligationReattemptRequest):
+    """
+    Create a new obligation linked to a failed one.
+    The failed obligation remains unchanged.
+    """
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        # Fetch failed obligation (ownership check)
+        obl_res = sb.table("obligations") \
+            .select("*") \
+            .eq("id", obligation_id) \
+            .eq("user_id", request.user_id) \
+            .single() \
+            .execute()
+        obl = getattr(obl_res, "data", None)
+        if not obl:
+            raise HTTPException(status_code=404, detail="Obligation not found")
+        if obl.get("status") != "failed":
+            raise HTTPException(status_code=409, detail="Only failed obligations can be reattempted.")
+
+        # Build new obligation
+        now = datetime.utcnow().isoformat()
+        source_ref = f"reattempt:{obligation_id}:{now}"
+        insert_payload = {
+            "user_id": request.user_id,
+            "type": obl["type"],
+            "title": request.title or obl["title"],
+            "source": "manual",
+            "source_ref": source_ref,
+            "deadline": request.new_deadline,
+            "status": "pending",
+            "proof_required": obl.get("proof_required", False),
+            "prior_failed_obligation_id": obligation_id,
+        }
+
+        new_res = sb.table("obligations") \
+            .insert(insert_payload) \
+            .select("*") \
+            .single() \
+            .execute()
+        new_obl = getattr(new_res, "data", None)
+        if not new_obl:
+            raise HTTPException(status_code=500, detail="Failed to create reattempt obligation")
+
+        # Append audit records (append-only)
+        sb.table("obligation_history").insert([
+            {
+                "obligation_id": obligation_id,
+                "user_id": request.user_id,
+                "event_type": "reattempt_created",
+                "reason": f"reattempt_obligation_id:{new_obl['id']}",
+            },
+            {
+                "obligation_id": new_obl["id"],
+                "user_id": request.user_id,
+                "event_type": "reattempt_created",
+                "reason": f"prior_failed_obligation_id:{obligation_id}",
+            },
+        ]).execute()
+
+        return {"status": "created", "obligation": new_obl}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Reattempt creation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/obligations/{obligation_id}/history")
+async def get_obligation_history(obligation_id: str, user_id: str):
+    """
+    Return append-only history for an obligation.
+    """
+    try:
+        from backend.email_monitor import _get_supabase
+        sb = _get_supabase()
+
+        obl_res = sb.table("obligations") \
+            .select("id") \
+            .eq("id", obligation_id) \
+            .eq("user_id", user_id) \
+            .single() \
+            .execute()
+        if not getattr(obl_res, "data", None):
+            raise HTTPException(status_code=404, detail="Obligation not found")
+
+        hist_res = sb.table("obligation_history") \
+            .select("*") \
+            .eq("obligation_id", obligation_id) \
+            .order("created_at", desc=True) \
+            .execute()
+
+        return {"history": hist_res.data or [], "count": len(hist_res.data or [])}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Obligation history error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -3591,6 +4247,7 @@ OBLIGATION_DEPENDENCY_MAP: dict[str, list[str]] = {
     "HOUSING_DEPOSIT": ["ACCEPTANCE"],
     "SCHOLARSHIP_DISBURSEMENT": ["SCHOLARSHIP"],
     "ENROLLMENT": ["FAFSA"],
+    "SCHOLARSHIP_ACCEPTANCE": ["ACCEPTANCE"],
 }
 
 # Extended obligation types (Phase 2 Step 1)
@@ -3598,6 +4255,13 @@ _OBLIGATION_TYPES = {
     "FAFSA", "APPLICATION_FEE", "APPLICATION_SUBMISSION",
     "HOUSING_DEPOSIT", "SCHOLARSHIP",
     "ACCEPTANCE", "SCHOLARSHIP_DISBURSEMENT", "ENROLLMENT",
+    "ENROLLMENT_DEPOSIT", "SCHOLARSHIP_ACCEPTANCE",
+}
+
+# Phase 4 Step 3: Controlled state propagation (exact rules only)
+PROPAGATION_RULES = {
+    "APPLICATION_SUBMISSION": ["HOUSING_DEPOSIT"],
+    "FAFSA": ["SCHOLARSHIP"],
 }
 
 
@@ -3618,6 +4282,117 @@ def _extract_school_context(source_ref: str) -> Optional[str]:
         if len(parts) >= 2:
             return parts[1]
     return None
+
+
+def _required_types_for_obligation(obl: dict, by_school_type: dict[str, dict[str, list[dict]]]) -> list[str]:
+    """
+    Dependency rules with one conditional:
+    HOUSING_DEPOSIT requires ENROLLMENT_DEPOSIT if it exists in the same context,
+    otherwise requires ACCEPTANCE.
+    """
+    obl_type = obl.get("type")
+    required = OBLIGATION_DEPENDENCY_MAP.get(obl_type, [])
+    if obl_type == "HOUSING_DEPOSIT":
+        ctx = _extract_school_context(obl.get("source_ref", "")) or "__no_school__"
+        has_enrollment_deposit = len(by_school_type.get(ctx, {}).get("ENROLLMENT_DEPOSIT", [])) > 0
+        return ["ENROLLMENT_DEPOSIT"] if has_enrollment_deposit else ["ACCEPTANCE"]
+    return required
+
+
+def _blocker_payload(dep_obl: dict) -> dict:
+    return {
+        "obligation_id": dep_obl["id"],
+        "type": dep_obl["type"],
+        "title": dep_obl["title"],
+        "status": dep_obl["status"],
+        "institution": _extract_school_context(dep_obl.get("source_ref", "")),
+        "deadline": dep_obl.get("deadline"),
+    }
+
+
+def _obligation_school_key(obl: dict) -> str:
+    ctx = _extract_school_context(obl.get("source_ref", ""))
+    return ctx or "__no_school__"
+
+
+def _can_unblock_obligation(sb, obligation_id: str) -> bool:
+    """
+    Return True if no unmet (non-overridden) dependencies remain.
+    """
+    deps_res = sb.table("obligation_dependencies") \
+        .select("depends_on_obligation_id") \
+        .eq("obligation_id", obligation_id) \
+        .execute()
+    dep_ids = [d["depends_on_obligation_id"] for d in (deps_res.data or [])]
+    if not dep_ids:
+        return True
+
+    overrides_res = sb.table("obligation_overrides") \
+        .select("overridden_dependency_id") \
+        .eq("obligation_id", obligation_id) \
+        .execute()
+    overridden_ids = {o["overridden_dependency_id"] for o in (overrides_res.data or [])}
+
+    dep_obls_res = sb.table("obligations") \
+        .select("id, status") \
+        .in_("id", dep_ids) \
+        .execute()
+    dep_obls = dep_obls_res.data or []
+
+    unmet = [
+        d for d in dep_obls
+        if d["status"] != "verified" and d["id"] not in overridden_ids
+    ]
+    return len(unmet) == 0
+
+
+def _propagate_unblock(sb, source_obl: dict) -> list[str]:
+    """
+    Controlled propagation: unblocks dependents only (no submit/verify).
+    Returns list of obligation IDs unblocked.
+    """
+    source_type = source_obl.get("type")
+    target_types = PROPAGATION_RULES.get(source_type, [])
+    if not target_types:
+        return []
+
+    # Scope by school context if present
+    source_key = _obligation_school_key(source_obl)
+
+    # Fetch candidate targets
+    targets_res = sb.table("obligations") \
+        .select("*") \
+        .eq("user_id", source_obl["user_id"]) \
+        .in_("type", target_types) \
+        .execute()
+    targets = targets_res.data or []
+
+    unblocked_ids = []
+    for t in targets:
+        if t.get("status") != "blocked":
+            continue
+        # Match school context if source has one
+        if source_key != "__no_school__" and _obligation_school_key(t) != source_key:
+            continue
+        if not _can_unblock_obligation(sb, t["id"]):
+            continue
+
+        sb.table("obligations") \
+            .update({"status": "pending"}) \
+            .eq("id", t["id"]) \
+            .execute()
+        unblocked_ids.append(t["id"])
+
+        # Audit propagation
+        sb.table("obligation_history").insert({
+            "obligation_id": t["id"],
+            "user_id": t["user_id"],
+            "event_type": "propagation_unblocked",
+            "reason": f"source_obligation_id:{source_obl['id']}",
+            "actor_user_id": source_obl["user_id"],
+        }).execute()
+
+    return unblocked_ids
 
 
 @app.get("/api/obligations/dependencies")
@@ -3674,8 +4449,7 @@ async def evaluate_obligation_dependencies(user_id: str):
         # Auto-create edges from the hardcoded dependency map
         edges_to_create = []
         for obl in all_obligations:
-            obl_type = obl["type"]
-            required_types = OBLIGATION_DEPENDENCY_MAP.get(obl_type, [])
+            required_types = _required_types_for_obligation(obl, by_school_type)
             if not required_types:
                 continue
 
@@ -3750,22 +4524,20 @@ async def evaluate_obligation_dependencies(user_id: str):
                 if dep_obl and dep_obl["status"] != "verified":
                     edge = (obl["id"], dep_id)
                     if edge in override_set:
+                        override_record = next(
+                            (ov for ov in override_details.get(obl["id"], [])
+                             if ov.get("overridden_dependency_id") == dep_id),
+                            None,
+                        )
                         # Phase 2 Step 3: This dependency was overridden.
                         # It no longer blocks, but we still surface it as "overridden"
                         # so the UI can show the override indicator.
                         overridden_deps.append({
-                            "obligation_id": dep_id,
-                            "type": dep_obl["type"],
-                            "title": dep_obl["title"],
-                            "status": dep_obl["status"],
+                            **_blocker_payload(dep_obl),
+                            "created_at": override_record.get("created_at") if override_record else None,
                         })
                     else:
-                        blockers.append({
-                            "obligation_id": dep_id,
-                            "type": dep_obl["type"],
-                            "title": dep_obl["title"],
-                            "status": dep_obl["status"],
-                        })
+                        blockers.append(_blocker_payload(dep_obl))
 
             is_blocked = len(blockers) > 0
             result.append({
@@ -4090,6 +4862,9 @@ def _compute_severity(
     # Rule 1: Verified = done
     if status == "verified":
         return ("normal", "verified")
+    # Rule 1b: Failed is terminal
+    if status == "failed":
+        return ("failed", "deadline_passed")
 
     # Time computation
     if deadline:
@@ -4507,6 +5282,7 @@ async def detect_stuck_obligations(user_id: str):
             sev_since = obl.get("severity_since")
             if obl.get("severity") != sev_level:
                 sev_since = now.isoformat()
+            should_mark_failed = sev_level == "failed" and status not in ("failed", "verified")
 
             results.append({
                 "obligation_id": obl_id,
@@ -4534,6 +5310,7 @@ async def detect_stuck_obligations(user_id: str):
                     "severity": sev_level,
                     "severity_reason": sev_reason,
                     "severity_since": sev_since,
+                    "status": "failed" if should_mark_failed else None,
                 })
             elif obl.get("stuck") or obl.get("severity") != sev_level:
                 # Stuck changed or severity changed — persist
@@ -4545,6 +5322,7 @@ async def detect_stuck_obligations(user_id: str):
                     "severity": sev_level,
                     "severity_reason": sev_reason,
                     "severity_since": sev_since,
+                    "status": "failed" if should_mark_failed else None,
                 })
 
         # Batch persist stuck state + severity updates
@@ -4560,6 +5338,8 @@ async def detect_stuck_obligations(user_id: str):
                     update_payload["severity"] = update["severity"]
                     update_payload["severity_reason"] = update["severity_reason"]
                     update_payload["severity_since"] = update["severity_since"]
+                if update.get("status") == "failed":
+                    update_payload["status"] = "failed"
                 sb.table("obligations") \
                     .update(update_payload) \
                     .eq("id", update["id"]) \

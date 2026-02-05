@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/supabase/auth-provider";
 import { useFollowUps, FollowUp } from "@/lib/hooks/useFollowUps";
 import EmailDraftModal from "@/components/financial-aid/EmailDraftModal";
+import CriticalOblBar from "@/components/financial-aid/CriticalOblBar";
 import {
   ArrowLeft,
   FileEdit,
@@ -78,6 +79,9 @@ export default function ApprovalsPage() {
           </div>
         </div>
       </header>
+
+      {/* Phase 3 Step 2: Cross-context visibility. */}
+      <CriticalOblBar />
 
       <main className="max-w-3xl mx-auto px-4 sm:px-6 py-8">
         {/* Filter tabs */}

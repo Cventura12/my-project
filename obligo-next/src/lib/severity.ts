@@ -100,6 +100,10 @@ export function computeSeverity(input: SeverityInput): SeverityResult {
   if (input.status === "verified") {
     return { level: "normal", reason: "verified" };
   }
+  // Rule 1b: Failed is terminal. Always failed severity.
+  if (input.status === "failed") {
+    return { level: "failed", reason: "deadline_passed" };
+  }
 
   // Time computation (only if deadline exists)
   if (input.deadline) {
@@ -226,3 +230,58 @@ export const SEVERITY_REASON_TEXT: Record<SeverityReason, string> = {
   stuck_no_deadline_pressure: "Structurally stuck, no deadline pressure",
   no_pressure: "No action pressure",
 };
+
+/**
+ * PHASE 3 STEP 2 — Visibility Pressure
+ *
+ * Numeric severity rank for sorting. Lower = more severe = appears first.
+ * Critical always floats to top. Failed is permanent and equally top-ranked.
+ */
+export const SEVERITY_RANK: Record<SeverityLevel, number> = {
+  failed: 0,
+  critical: 0,
+  high: 2,
+  elevated: 3,
+  normal: 4,
+};
+
+/**
+ * Compute days remaining until deadline. Null if no deadline.
+ * Negative values mean overdue. Used for secondary sort.
+ */
+function _deadlineDaysRemaining(deadline: string | null): number {
+  if (!deadline) return Infinity; // No deadline = lowest urgency
+  const now = new Date();
+  const dl = new Date(deadline);
+  return (dl.getTime() - now.getTime()) / (1000 * 60 * 60 * 24);
+}
+
+/**
+ * Compare two obligations for display ordering.
+ * Pure function. Deterministic. No AI.
+ *
+ * ORDERING RULES (Phase 3 Step 2):
+ * 1. Severity (failed/critical first)
+ * 2. Deadline proximity (closest deadline first)
+ * 3. Stuck state (stuck before non-stuck)
+ *
+ * Critical always floats to top. This is not configurable.
+ */
+export function compareObligations(
+  a: { severity: SeverityLevel; deadline: string | null; stuck: boolean },
+  b: { severity: SeverityLevel; deadline: string | null; stuck: boolean },
+): number {
+  // 1. Severity rank
+  const rankDiff = SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity];
+  if (rankDiff !== 0) return rankDiff;
+
+  // 2. Deadline proximity (closer deadline = higher priority)
+  const aDays = _deadlineDaysRemaining(a.deadline);
+  const bDays = _deadlineDaysRemaining(b.deadline);
+  if (aDays !== bDays) return aDays - bDays;
+
+  // 3. Stuck state (stuck first)
+  if (a.stuck !== b.stuck) return a.stuck ? -1 : 1;
+
+  return 0;
+}

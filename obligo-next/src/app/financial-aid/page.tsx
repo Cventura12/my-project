@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef, type ChangeEvent } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/supabase/auth-provider";
 import { useSchools } from "@/lib/hooks/useSchools";
@@ -10,7 +10,7 @@ import { useFollowUps } from "@/lib/hooks/useFollowUps";
 import { createSupabaseBrowser } from "@/lib/supabase/client";
 import SchoolCard from "@/components/financial-aid/SchoolCard";
 import {
-  Plus, LogOut, FileText, AlertTriangle, CheckCircle2, Clock,
+  Plus, LogOut, FileText, AlertTriangle, CheckCircle2,
   Mail, FileEdit, MessageSquareWarning, Loader2, ShieldAlert, XOctagon, Ban, Lock, AlertCircle, Pause,
 } from "lucide-react";
 import {
@@ -21,6 +21,12 @@ import {
   daysRemainingText,
   type EscalationLevel,
 } from "@/lib/escalation";
+import {
+  computeSeverity,
+  compareObligations,
+  SEVERITY_STYLES,
+  type SeverityLevel,
+} from "@/lib/severity";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -73,6 +79,14 @@ export default function FinancialAidDashboard() {
   } | null>(null);
   const [overrideReason, setOverrideReason] = useState("");
   const [overrideSubmitting, setOverrideSubmitting] = useState(false);
+  const proofInputRef = useRef<HTMLInputElement | null>(null);
+  const [proofUploadTarget, setProofUploadTarget] = useState<string | null>(null);
+  const [proofUploading, setProofUploading] = useState(false);
+  const [portalText, setPortalText] = useState("");
+  const [intakeDraft, setIntakeDraft] = useState<{ itemId: string; extraction: any } | null>(null);
+  const [intakeLoading, setIntakeLoading] = useState(false);
+  const [intakeError, setIntakeError] = useState<string | null>(null);
+  const [stepsByObligationId, setStepsByObligationId] = useState<Record<string, any[]>>({});
 
   // Phase 2 Step 4: Stuck state.
   // Maps obligation_id -> stuck info (reason, chain, deadlock flag).
@@ -91,6 +105,30 @@ export default function FinancialAidDashboard() {
       router.push("/login");
     }
   }, [authLoading, user, router]);
+
+  // Phase 4 Step 2: Read-only step display (process truth only)
+  useEffect(() => {
+    if (!user || obligationsLoading) return;
+    const stepful = obligations.filter((o) => o.type === "FAFSA" || o.type === "SCHOLARSHIP");
+    if (stepful.length === 0) return;
+
+    const fetchSteps = async () => {
+      const entries = await Promise.all(stepful.map(async (obl) => {
+        try {
+          const res = await fetch(`${API_BASE}/api/obligations/${obl.id}/steps?user_id=${user.id}`);
+          if (!res.ok) return [obl.id, []] as const;
+          const data = await res.json();
+          return [obl.id, data.steps || []] as const;
+        } catch {
+          return [obl.id, []] as const;
+        }
+      }));
+      const next: Record<string, any[]> = {};
+      for (const [id, steps] of entries) next[id] = steps;
+      setStepsByObligationId(next);
+    };
+    fetchSteps();
+  }, [user, obligationsLoading, obligations]);
 
   // Phase 1 Step 4: Detect proof-missing obligations
   useEffect(() => {
@@ -205,24 +243,59 @@ export default function FinancialAidDashboard() {
     });
   };
 
+  // Phase 3 Step 1: Compute severity client-side for immediate display.
+  // Uses stuckMap for stuck state. Both client and server compute the same result.
+  // Severity drives VISUAL treatment. Escalation (above) drives BEHAVIORAL checks.
+  const getOblSeverity = (obl: ObligationRow): SeverityLevel => {
+    const isStuck = !!stuckMap[obl.id];
+    return computeSeverity({
+      status: obl.status,
+      deadline: obl.deadline,
+      stuck: isStuck,
+    }).level;
+  };
+
   // Canonical stats: obligations only.
   const totalObligations = obligations.length;
   const submitted = obligations.filter((o) => o.status === "submitted" || o.status === "verified").length;
 
-  // Step 5: Escalation-aware stats replace naive "overdue" and "pending" counts.
-  const failureCount = obligations.filter((o) => getOblEscalation(o) === "failure").length;
-  const criticalCount = obligations.filter((o) => getOblEscalation(o) === "critical").length;
-  const urgentCount = obligations.filter((o) => getOblEscalation(o) === "urgent").length;
+  // Phase 3 Step 1: Severity-aware stats replace escalation stats.
+  const failedCount = obligations.filter((o) => getOblSeverity(o) === "failed").length;
+  const criticalCount = obligations.filter((o) => getOblSeverity(o) === "critical").length;
+  const highCount = obligations.filter((o) => getOblSeverity(o) === "high").length;
+  const elevatedCount = obligations.filter((o) => getOblSeverity(o) === "elevated").length;
 
-  const visibleObligations = obligations
-    // Phase 1 Step 3: include submitted so verification is possible (proof-gated).
-    .filter((o) => o.status !== "verified")
-    // Phase 1 Step 5: Sort by escalation severity. Failures first.
-    .sort((a, b) => {
-      const order: Record<EscalationLevel, number> = { failure: 0, critical: 1, urgent: 2, normal: 3 };
-      return order[getOblEscalation(a)] - order[getOblEscalation(b)];
-    })
-    .slice(0, 12);
+  // Phase 3 Step 2: Visibility pressure ordering.
+  // Three-key sort: severity → deadline proximity → stuck state.
+  // Critical and failed ALWAYS float to top and are NEVER sliced off.
+  // The slice limit only applies to lower-severity obligations.
+  //
+  // FAILURE VISIBILITY RULE (Phase 3 Step 2):
+  // Failed obligations are a RECORD, not an event. They:
+  //   - Never disappear from the list automatically
+  //   - Are never hidden by the 12-item display limit
+  //   - Are never filtered out (the only filter is "verified", which failed obligations are NOT)
+  //   - Cannot be dismissed, archived, or swept away
+  // If you add a filter feature later, failed obligations MUST bypass it.
+  const nonVerified = obligations.filter((o) => o.status !== "verified");
+  const sorted = [...nonVerified].sort((a, b) =>
+    compareObligations(
+      { severity: getOblSeverity(a), deadline: a.deadline, stuck: !!stuckMap[a.id] },
+      { severity: getOblSeverity(b), deadline: b.deadline, stuck: !!stuckMap[b.id] },
+    )
+  );
+  // Critical and failed are NEVER hidden. They bypass the display limit.
+  const criticalAndFailed = sorted.filter((o) => {
+    const s = getOblSeverity(o);
+    return s === "critical" || s === "failed";
+  });
+  const criticalPreview = criticalAndFailed.slice(0, 3);
+  const rest = sorted.filter((o) => {
+    const s = getOblSeverity(o);
+    return s !== "critical" && s !== "failed";
+  });
+  const visibleRest = rest.slice(0, Math.max(0, 12 - criticalAndFailed.length));
+  const visibleObligations = [...criticalAndFailed, ...visibleRest];
 
   const ensureProofExists = async (obligationId: string): Promise<boolean> => {
     const { data, error } = await supabase
@@ -356,6 +429,153 @@ export default function FinancialAidDashboard() {
     }
   };
 
+  const triggerProofUpload = (oblId: string) => {
+    setProofUploadTarget(oblId);
+    if (proofInputRef.current) proofInputRef.current.click();
+  };
+
+  const handleProofFileSelected = async (e: ChangeEvent<HTMLInputElement>) => {
+    if (!user || !proofUploadTarget) return;
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setProofUploading(true);
+    setIntakeError(null);
+    try {
+      const path = `${user.id}/${proofUploadTarget}/${file.name}`;
+      const uploadRes = await supabase.storage.from('proofs').upload(path, file, { upsert: false });
+      if (uploadRes.error) throw uploadRes.error;
+
+      const uploadRow = await supabase.from('uploads').insert({
+        user_id: user.id,
+        bucket: 'proofs',
+        path,
+        mime_type: file.type,
+        size_bytes: file.size,
+      }).select('id').single();
+      if (uploadRow.error) throw uploadRow.error;
+
+      const proofRes = await supabase.from('obligation_proofs').insert({
+        obligation_id: proofUploadTarget,
+        type: 'file_upload',
+        source_ref: path,
+      });
+      if (proofRes.error) throw proofRes.error;
+    } catch (err: any) {
+      alert(err?.message || 'Failed to upload proof');
+    } finally {
+      setProofUploading(false);
+      setProofUploadTarget(null);
+      if (proofInputRef.current) proofInputRef.current.value = '';
+    }
+  };
+
+  const handlePortalPaste = async () => {
+    if (!user || !portalText.trim()) return;
+    setIntakeLoading(true);
+    setIntakeError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/intake/portal-paste`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: user.id, raw_text: portalText }),
+      });
+      if (!res.ok) throw new Error('Portal paste intake failed');
+      const data = await res.json();
+      setIntakeDraft({ itemId: data.intake_item.id, extraction: data.extraction });
+      setPortalText('');
+    } catch (e: any) {
+      setIntakeError(e?.message || 'Portal paste intake failed');
+    } finally {
+      setIntakeLoading(false);
+    }
+  };
+
+  const handleOcrUpload = async (file: File) => {
+    if (!user || !file) return;
+    setIntakeLoading(true);
+    setIntakeError(null);
+    try {
+      const source = file.type === 'application/pdf' ? 'pdf' : 'screenshot';
+      const createRes = await fetch(`${API_BASE}/api/intake/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: user.id, source }),
+      });
+      if (!createRes.ok) throw new Error('Failed to create intake item');
+      const createData = await createRes.json();
+      const intakeItemId = createData.intake_item.id;
+
+      const path = `${user.id}/${intakeItemId}/${file.name}`;
+      const uploadRes = await supabase.storage.from('intake').upload(path, file, { upsert: false });
+      if (uploadRes.error) throw uploadRes.error;
+
+      const uploadRow = await supabase.from('uploads').insert({
+        user_id: user.id,
+        bucket: 'intake',
+        path,
+        mime_type: file.type,
+        size_bytes: file.size,
+      }).select('id').single();
+      if (uploadRow.error) throw uploadRow.error;
+
+      const ocrRes = await fetch(`${API_BASE}/api/intake/${intakeItemId}/ocr`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_id: user.id,
+          bucket: 'intake',
+          path,
+          upload_id: uploadRow.data.id,
+          source,
+        }),
+      });
+      if (!ocrRes.ok) throw new Error('OCR intake failed');
+      const ocrData = await ocrRes.json();
+      setIntakeDraft({ itemId: intakeItemId, extraction: ocrData.extraction });
+    } catch (e: any) {
+      setIntakeError(e?.message || 'OCR intake failed');
+    } finally {
+      setIntakeLoading(false);
+    }
+  };
+
+
+  const handleIntakeConfirm = async () => {
+    if (!user || !intakeDraft) return;
+    setIntakeLoading(true);
+    setIntakeError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/intake/${intakeDraft.itemId}/confirm`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ user_id: user.id }),
+      });
+      if (!res.ok) throw new Error('Confirm failed');
+      setIntakeDraft(null);
+      await refreshObligations();
+    } catch (e: any) {
+      setIntakeError(e?.message || 'Confirm failed');
+    } finally {
+      setIntakeLoading(false);
+    }
+  };
+
+  const handleIntakeDiscard = async () => {
+    if (!user || !intakeDraft) return;
+    setIntakeLoading(true);
+    setIntakeError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/intake/${intakeDraft.itemId}/discard?user_id=${user.id}`, { method: 'POST' });
+      if (!res.ok) throw new Error('Discard failed');
+      setIntakeDraft(null);
+    } catch (e: any) {
+      setIntakeError(e?.message || 'Discard failed');
+    } finally {
+      setIntakeLoading(false);
+    }
+  };
+
+
   // Phase 1 Step 4: Generate a recovery draft for a proof-missing obligation
   const handleGenerateFollowUp = async (oblId: string) => {
     if (!user) return;
@@ -457,6 +677,392 @@ export default function FinancialAidDashboard() {
 
   if (!user) return null;
 
+  const renderObligationRow = (obl: ObligationRow, emphasizeCritical = false) => {
+    // Phase 1 Step 5: Escalation — BEHAVIORAL checks only.
+    // Still needed for: isVerificationBlocked, proof button coloring, silent failure.
+    const escalation = getOblEscalation(obl);
+    const silentFailure = isOblSilentFailure(obl);
+    const hasProof = obl.proof_required ? !proofMissingIds.has(obl.id) : true;
+    const verifyBlocked = isVerificationBlocked(escalation, obl.proof_required, hasProof);
+    const remaining = daysRemainingText(obl.deadline);
+
+    // Phase 2 Step 1 & 2: Dependency-blocked state.
+    const blockers = depBlockers[obl.id] || [];
+    const depBlocked = blockers.length > 0;
+    // Phase 2 Step 4: Stuck state.
+    const stuckInfo = stuckMap[obl.id] || null;
+    const isStuck = !!stuckInfo;
+
+    // Phase 3 Step 1: Severity — VISUAL treatment.
+    const severity = getOblSeverity(obl);
+    const sevStyle = SEVERITY_STYLES[severity];
+    const steps = stepsByObligationId[obl.id] || [];
+    const firstIncomplete = steps.find((s) => s.status !== "completed") || null;
+    const stepLabel = (stepType: string): string => {
+      switch (stepType) {
+        case "FAFSA_SUBMITTED":
+          return "FAFSA submitted";
+        case "FAFSA_PROCESSED":
+          return "FAFSA processed";
+        case "SCHOOL_RECEIVED":
+          return "School received FAFSA";
+        case "APPLICATION_SUBMITTED":
+          return "Application submitted";
+        case "ACCEPTANCE_CONFIRMED":
+          return "Acceptance confirmed";
+        default:
+          return stepType;
+      }
+    };
+    const blockReasonText = (stepType: string): string => {
+      switch (stepType) {
+        case "FAFSA_SUBMITTED":
+          return "Blocked: FAFSA has not been submitted.";
+        case "FAFSA_PROCESSED":
+          return "Blocked: FAFSA has not been processed.";
+        case "SCHOOL_RECEIVED":
+          return "Blocked: School has not received FAFSA.";
+        case "APPLICATION_SUBMITTED":
+          return "Blocked: Scholarship application has not been submitted.";
+        case "ACCEPTANCE_CONFIRMED":
+          return "Blocked: Scholarship acceptance not confirmed.";
+        default:
+          return "Blocked: Required step incomplete.";
+      }
+    };
+
+    // Phase 3 Step 2: Visual weight.
+    const isCriticalOrFailed = severity === "critical" || severity === "failed";
+    const criticalBorderWidth = emphasizeCritical ? "border-l-[8px]" : "border-l-[6px]";
+    const rowBorder = depBlocked && severity === "normal"
+      ? "border-l-4 border-l-gray-500"
+      : isStuck && severity === "normal"
+      ? "border-l-4 border-l-indigo-500"
+      : isCriticalOrFailed
+      ? `${criticalBorderWidth} ${severity === "failed" ? "border-l-red-700" : "border-l-red-500"}`
+      : sevStyle.rowBorder;
+    const rowBg = depBlocked && severity === "normal"
+      ? "bg-gray-50/70"
+      : isStuck && severity === "normal"
+      ? "bg-indigo-50/60"
+      : sevStyle.rowBg;
+    const rowPadding = isCriticalOrFailed
+      ? (emphasizeCritical ? "py-5 pl-5 pr-3" : "py-4 pl-4 pr-2")
+      : "py-3 pl-3";
+    const titleClass = isCriticalOrFailed
+      ? (emphasizeCritical ? "text-lg font-black" : "text-base font-bold")
+      : "text-sm font-semibold";
+    const iconSize = emphasizeCritical ? "w-5 h-5" : "w-4 h-4";
+
+    return (
+      <div
+        key={obl.id}
+        className={`${rowPadding} flex items-start justify-between gap-4 rounded-lg ${rowBorder} ${rowBg}`}
+      >
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            {/* Phase 3 Step 2: Critical/Failed get a leading icon. */}
+            {severity === "failed" && (
+              <XOctagon className={`${iconSize} text-red-700 shrink-0`} />
+            )}
+            {severity === "critical" && (
+              <AlertTriangle className={`${iconSize} text-red-600 shrink-0`} />
+            )}
+            <p className={`${titleClass} text-black truncate`}>{obl.title}</p>
+            {/* Phase 2 Step 2: BLOCKED badge — first badge, always visible when blocked. */}
+            {depBlocked && (
+              <span className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-black uppercase rounded-full bg-gray-700 text-white border border-gray-800">
+                <Lock className="w-2.5 h-2.5" />
+                BLOCKED
+              </span>
+            )}
+            {/* Phase 2 Step 4: STUCK badge — structural immobility. */}
+            {isStuck && (
+              <span className={`shrink-0 inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-black uppercase rounded-full ${
+                stuckInfo?.is_deadlocked
+                  ? "bg-red-800 text-white border border-red-900"
+                  : "bg-indigo-700 text-white border border-indigo-800"
+              }`}>
+                <Pause className="w-2.5 h-2.5" />
+                {stuckInfo?.is_deadlocked ? "DEADLOCK" : "STUCK"}
+              </span>
+            )}
+            {/* Phase 3 Step 1: Severity badge — replaces escalation badge for visual treatment */}
+            {sevStyle.badgeText && (
+              <span className={`shrink-0 px-2 py-0.5 text-[10px] font-black uppercase rounded-full ${sevStyle.badge}`}>
+                {sevStyle.badgeText}
+              </span>
+            )}
+          </div>
+          <p className="text-[10px] text-gray-400 mt-0.5">
+            {obl.type} - {obl.source}
+          </p>
+          {depBlocked && blockers.length > 0 && (
+            <p className="text-[11px] font-semibold text-gray-700 mt-1">
+              Blocked by: {blockers.map((b) => `${b.type} (${(b.status || "").toUpperCase()})`).join(", ")}
+            </p>
+          )}
+          {/* Phase 3 Step 2: Explicit FAILED label text */}
+          {severity === "failed" && (
+            <p className="text-[11px] font-black mt-1 text-red-800">
+              FAILED — {sevStyle.label}
+            </p>
+          )}
+          {/* Phase 3 Step 2: Severity label — visible only for critical */}
+          {severity === "critical" && sevStyle.label && (
+            <p className="text-[11px] font-semibold mt-1 text-red-700">
+              {sevStyle.label}
+            </p>
+          )}
+          {obl.proof_required && (
+            <span className="inline-block mt-1 px-2 py-0.5 text-[10px] font-semibold uppercase rounded-full bg-amber-50 text-amber-700 border border-amber-200">
+              Proof required
+            </span>
+          )}
+          {proofMissingIds.has(obl.id) && (
+            <span className="inline-flex items-center gap-1 mt-1 ml-1 px-2 py-0.5 text-[10px] font-semibold uppercase rounded-full bg-orange-50 text-orange-700 border border-orange-200">
+              <MessageSquareWarning className="w-3 h-3" />
+              Follow-up recommended
+            </span>
+          )}
+
+          {/* Phase 4 Step 2: Read-only step list (process truth only) */}
+          {steps.length > 0 && (
+            <div className="mt-2">
+              <p className="text-[10px] font-semibold uppercase text-gray-500 mb-1">
+                Steps
+              </p>
+              <div className="space-y-1">
+                {steps.map((s) => {
+                  const isIncomplete = firstIncomplete && s.id === firstIncomplete.id;
+                  const isCompleted = s.status === "completed";
+                  return (
+                    <div
+                      key={s.id}
+                      className={`text-[11px] px-2 py-1 rounded border ${
+                        isCompleted
+                          ? "bg-emerald-50 text-emerald-800 border-emerald-200"
+                          : isIncomplete
+                          ? "bg-red-50 text-red-800 border-red-300 font-semibold"
+                          : "bg-gray-50 text-gray-700 border-gray-200"
+                      }`}
+                    >
+                      {stepLabel(s.step_type)} — {isCompleted ? "completed" : "pending"}
+                    </div>
+                  );
+                })}
+              </div>
+              {firstIncomplete && obl.status !== "verified" && (
+                <p className="text-[11px] font-semibold text-red-800 mt-2">
+                  {blockReasonText(firstIncomplete.step_type)}
+                </p>
+              )}
+            </div>
+          )}
+
+          {/* Silent failure warning — styling from severity, logic from escalation */}
+          {silentFailure && (
+            <div className={`mt-2 px-3 py-2 rounded-lg text-xs font-medium ${
+              severity === "failed"
+                ? "bg-red-100 text-red-800 border border-red-300"
+                : severity === "critical" || severity === "high"
+                ? "bg-red-50 text-red-700 border border-red-200"
+                : "bg-orange-50 text-orange-700 border border-orange-200"
+            }`}>
+              This obligation was submitted but has not been confirmed.
+              {severity === "failed"
+                ? " Silent failure. Deadline has passed."
+                : severity === "critical" || severity === "high"
+                ? " Silent failure risk. Deadline imminent."
+                : " No confirmation exists."}
+            </div>
+          )}
+
+          {/* Verification blocked warning — escalation still drives this BEHAVIORAL check */}
+          {verifyBlocked && (
+            <div className="mt-2 px-3 py-2 rounded-lg text-xs font-semibold bg-red-100 text-red-800 border border-red-300">
+              Verification blocked. Proof is required at {ESCALATION_STYLES[escalation].badgeText} level.
+            </div>
+          )}
+
+          {/* Phase 2 Step 2: Dependency-blocked warning — LEGIBLE. */}
+          {depBlocked && (
+            <div className="mt-2 px-3 py-2.5 rounded-lg text-xs font-medium bg-gray-100 text-gray-800 border-2 border-gray-400">
+              <div className="flex items-center gap-1.5 font-bold mb-1.5 text-gray-900">
+                <Ban className="w-3.5 h-3.5" />
+                Blocked by {blockers.length} prerequisite{blockers.length > 1 ? "s" : ""}
+              </div>
+              {blockers.map((b) => {
+                const action =
+                  b.status === "pending" || b.status === "blocked"
+                    ? `Submit and verify "${b.title}"`
+                    : b.status === "submitted"
+                    ? `Verify "${b.title}"`
+                    : `Complete "${b.title}"`;
+                return (
+                  <div key={b.obligation_id} className="ml-5 mb-1.5 last:mb-0">
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <p className="text-[11px] text-gray-700 font-semibold">
+                          {b.type}: {b.title} — <span className="uppercase text-gray-500">{b.status}</span>
+                        </p>
+                        <p className="text-[10px] text-gray-600 italic">
+                          → {action} to unblock
+                        </p>
+                      </div>
+                      {/* Phase 2 Step 3: Override button — per-blocker, deliberate. */}
+                      <button
+                        onClick={() => {
+                          setOverrideTarget({ obligationId: obl.id, blocker: b });
+                          setOverrideReason("");
+                        }}
+                        className="shrink-0 px-2 py-0.5 text-[9px] font-semibold rounded border border-gray-300 text-gray-500 hover:text-red-600 hover:border-red-400 transition-colors"
+                      >
+                        Override
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+          {/* Phase 2 Step 3: Overridden dependency indicator. */}
+          {(overriddenDeps[obl.id] || []).length > 0 && (
+            <div className="mt-2 px-3 py-2 rounded-lg text-xs font-medium bg-amber-50 text-amber-800 border border-amber-300">
+              <div className="flex items-center gap-1.5 font-semibold mb-1">
+                <AlertCircle className="w-3.5 h-3.5 text-amber-600" />
+                {(overriddenDeps[obl.id] || []).length} dependency override{(overriddenDeps[obl.id] || []).length > 1 ? "s" : ""} active
+              </div>
+              {(overriddenDeps[obl.id] || []).map((od) => (
+                <div key={od.obligation_id} className="ml-5">
+                  <p className="text-[10px] text-amber-700">
+                    {od.type}: {od.title} — <span className="uppercase">{od.status}</span> (overridden)
+                  </p>
+                  {od.created_at && (
+                    <p className="text-[10px] text-amber-800 font-semibold">
+                      Risk accepted by user on {new Date(od.created_at).toLocaleDateString()}.
+                    </p>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Phase 2 Step 4 + Phase 3 Step 1: Stuck reason box. */}
+          {isStuck && stuckInfo && (
+            <div className={`mt-2 px-3 py-2.5 rounded-lg text-xs font-medium border ${
+              stuckInfo.is_deadlocked
+                ? "bg-red-100 text-red-900 border-red-400"
+                : severity === "failed" || severity === "critical"
+                ? "bg-red-50 text-red-800 border-red-300"
+                : severity === "high"
+                ? "bg-orange-50 text-orange-900 border-orange-300"
+                : severity === "elevated"
+                ? "bg-yellow-50 text-yellow-900 border-yellow-300"
+                : "bg-indigo-50 text-indigo-900 border-indigo-300"
+            }`}>
+              <div className="flex items-center gap-1.5 font-bold mb-1">
+                <Pause className="w-3.5 h-3.5 shrink-0" />
+                {stuckInfo.is_deadlocked
+                  ? "Dependency deadlock. Unresolvable by user."
+                  : `No progress for ${stuckInfo.days_stale} day${stuckInfo.days_stale !== 1 ? "s" : ""}`}
+              </div>
+              <p className="text-[11px] mb-1">
+                {STUCK_REASON_TEXT[stuckInfo.stuck_reason || ""] || stuckInfo.stuck_reason}
+              </p>
+              {stuckInfo.chain.length > 0 && (
+                <div className="mt-1.5 pt-1.5 border-t border-current/10">
+                  <p className="text-[10px] font-semibold uppercase mb-0.5 opacity-70">
+                    Dependency chain
+                  </p>
+                  <p className="text-[10px] font-mono">
+                    {obl.type}
+                    {stuckInfo.chain.map((link) => (
+                      <span key={link.obligation_id}>
+                        {" → "}
+                        {link.type} ({link.status})
+                        {link.is_cycle_back && (
+                          <span className="font-bold text-red-600"> ← CYCLE</span>
+                        )}
+                      </span>
+                    ))}
+                  </p>
+                </div>
+              )}
+              {stuckInfo.stuck_since && (
+                <p className="text-[9px] mt-1 opacity-60">
+                  Stuck since {new Date(stuckInfo.stuck_since).toLocaleDateString()}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+        <div className="text-right shrink-0">
+          <p className={`text-xs font-medium ${sevStyle.deadlineColor}`}>
+            {obl.deadline ? new Date(obl.deadline).toLocaleDateString() : "No deadline"}
+          </p>
+          {remaining && (
+            <p className={`text-[10px] font-semibold mt-0.5 ${sevStyle.deadlineColor}`}>
+              {remaining}
+            </p>
+          )}
+          <p className={`text-[10px] font-semibold uppercase mt-0.5 ${sevStyle.statusColor}`}>
+            {obl.status}
+          </p>
+          <div className="mt-2 flex items-center justify-end gap-2 flex-wrap">
+            {obl.proof_required && obl.status !== "verified" && (
+              <button
+                onClick={() => attachManualProof(obl.id)}
+                disabled={busyObligationId === obl.id}
+                className={`px-2.5 py-1 text-[10px] font-semibold rounded-lg border transition-colors disabled:opacity-50 ${
+                  escalation === "critical" || escalation === "failure"
+                    ? "border-red-400 text-red-700 hover:border-red-600 hover:bg-red-50 font-bold"
+                    : "border-gray-200 text-gray-600 hover:border-black hover:text-black"
+                }`}
+                title="Attach proof (append-only)"
+              >
+                Proof
+              </button>
+            )}
+            {(obl.status === "pending" || obl.status === "blocked") && !depBlocked && (
+              <button
+                onClick={() => setObligationStatus(obl.id, "submitted", obl.proof_required)}
+                disabled={busyObligationId === obl.id}
+                className="px-2.5 py-1 text-[10px] font-semibold rounded-lg bg-black text-white hover:bg-gray-800 disabled:opacity-50 transition-colors"
+              >
+                Submitted
+              </button>
+            )}
+            {obl.status === "submitted" && !verifyBlocked && !depBlocked && (
+              <button
+                onClick={() => setObligationStatus(obl.id, "verified", obl.proof_required)}
+                disabled={busyObligationId === obl.id}
+                className="px-2.5 py-1 text-[10px] font-semibold rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors"
+                title={obl.proof_required ? "Blocked without proof" : "Mark verified"}
+              >
+                Verify
+              </button>
+            )}
+            {proofMissingIds.has(obl.id) && (
+              <button
+                onClick={() => handleGenerateFollowUp(obl.id)}
+                disabled={generatingFollowUp === obl.id}
+                className="px-2.5 py-1 text-[10px] font-semibold rounded-lg bg-orange-600 text-white hover:bg-orange-700 disabled:opacity-50 transition-colors"
+                title="Generate a follow-up email draft (requires your approval before sending)"
+              >
+                {generatingFollowUp === obl.id ? (
+                  <Loader2 className="w-3 h-3 animate-spin inline" />
+                ) : (
+                  "Follow-up"
+                )}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="min-h-screen bg-[#F0FDF4]">
       {/* Header */}
@@ -507,7 +1113,52 @@ export default function FinancialAidDashboard() {
       </header>
 
       <main className="max-w-3xl mx-auto px-4 sm:px-6 py-8">
-        {/* Stats — Phase 1 Step 5: escalation-aware stat cards */}
+        <input type="file" ref={proofInputRef} onChange={handleProofFileSelected} className="hidden" />
+        {/* Phase 3 Step 2: Global header strip (always visible, not filterable) */}
+        {criticalAndFailed.length > 0 && (
+          <div className="bg-red-700 border-2 border-red-900 rounded-xl p-4 mb-6">
+            <div className="flex items-start justify-between gap-4 flex-wrap">
+              <div className="flex items-start gap-3">
+                <XOctagon className="w-6 h-6 text-white shrink-0" />
+                <div>
+                  <p className="text-sm text-white font-black uppercase tracking-wide">
+                    Critical Now
+                  </p>
+                  <p className="text-xs text-red-100 mt-0.5 font-semibold">
+                    {criticalAndFailed.length} obligation{criticalAndFailed.length > 1 ? "s" : ""} critical or failed.
+                  </p>
+                  <p className="text-[10px] text-red-200 mt-1">
+                    Critical items are always shown. This is intentional. Visibility over elegance.
+                  </p>
+                </div>
+              </div>
+              <div className="flex-1 min-w-[220px]">
+                <div className="space-y-2">
+                  {criticalPreview.map((obl) => {
+                    const severity = getOblSeverity(obl);
+                    const sevStyle = SEVERITY_STYLES[severity];
+                    return (
+                      <div key={`critical-strip-${obl.id}`} className="bg-red-800/60 border border-red-900 rounded-lg px-3 py-2 flex items-center justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="text-[11px] font-bold text-white truncate">
+                            {obl.title}
+                          </p>
+                          <p className="text-[10px] text-red-100">
+                            {obl.deadline ? new Date(obl.deadline).toLocaleDateString() : "No deadline"}
+                          </p>
+                        </div>
+                        <span className={`shrink-0 px-2 py-0.5 text-[10px] font-black uppercase rounded-full ${sevStyle.badge}`}>
+                          {sevStyle.badgeText || severity.toUpperCase()}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+        {/* Stats — Phase 3 Step 1: severity-aware stat cards */}
         {totalObligations > 0 && (
           <div className="grid grid-cols-4 gap-3 mb-8">
             <div className="bg-white border-2 border-black rounded-xl p-4 text-center">
@@ -520,28 +1171,73 @@ export default function FinancialAidDashboard() {
               <p className="text-2xl font-bold text-emerald-600 mt-1">{submitted}</p>
               <p className="text-[10px] text-gray-400 font-medium uppercase">Submitted</p>
             </div>
-            <div className={`bg-white border-2 rounded-xl p-4 text-center ${criticalCount > 0 ? "border-red-400" : urgentCount > 0 ? "border-yellow-400" : "border-black"}`}>
-              <ShieldAlert className={`w-5 h-5 mx-auto ${criticalCount > 0 ? "text-red-500" : urgentCount > 0 ? "text-yellow-500" : "text-gray-400"}`} />
-              <p className={`text-2xl font-bold mt-1 ${criticalCount > 0 ? "text-red-600" : urgentCount > 0 ? "text-yellow-600" : "text-gray-600"}`}>
-                {criticalCount + urgentCount}
+            <div className={`bg-white border-2 rounded-xl p-4 text-center ${
+              criticalCount > 0 ? "border-red-400"
+                : highCount > 0 ? "border-orange-400"
+                : elevatedCount > 0 ? "border-yellow-400"
+                : "border-black"
+            }`}>
+              <ShieldAlert className={`w-5 h-5 mx-auto ${
+                criticalCount > 0 ? "text-red-500"
+                  : highCount > 0 ? "text-orange-500"
+                  : elevatedCount > 0 ? "text-yellow-500"
+                  : "text-gray-400"
+              }`} />
+              <p className={`text-2xl font-bold mt-1 ${
+                criticalCount > 0 ? "text-red-600"
+                  : highCount > 0 ? "text-orange-600"
+                  : elevatedCount > 0 ? "text-yellow-600"
+                  : "text-gray-600"
+              }`}>
+                {criticalCount + highCount + elevatedCount}
               </p>
               <p className="text-[10px] text-gray-400 font-medium uppercase">At Risk</p>
             </div>
-            <div className={`border-2 rounded-xl p-4 text-center ${failureCount > 0 ? "bg-red-100 border-red-600" : "bg-white border-black"}`}>
-              <XOctagon className={`w-5 h-5 mx-auto ${failureCount > 0 ? "text-red-700" : "text-gray-400"}`} />
-              <p className={`text-2xl font-black mt-1 ${failureCount > 0 ? "text-red-800" : "text-gray-600"}`}>{failureCount}</p>
-              <p className={`text-[10px] font-medium uppercase ${failureCount > 0 ? "text-red-700 font-bold" : "text-gray-400"}`}>Failed</p>
+            <div className={`border-2 rounded-xl p-4 text-center ${failedCount > 0 ? "bg-red-100 border-red-600" : "bg-white border-black"}`}>
+              <XOctagon className={`w-5 h-5 mx-auto ${failedCount > 0 ? "text-red-700" : "text-gray-400"}`} />
+              <p className={`text-2xl font-black mt-1 ${failedCount > 0 ? "text-red-800" : "text-gray-600"}`}>{failedCount}</p>
+              <p className={`text-[10px] font-medium uppercase ${failedCount > 0 ? "text-red-700 font-bold" : "text-gray-400"}`}>Failed</p>
             </div>
           </div>
         )}
 
-        {/* Phase 1 Step 5: Failure banner — unmistakable */}
-        {failureCount > 0 && (
+        {/* Phase 3 Step 1: Severity banners — priority order, only highest shown */}
+        {/* Phase 3 Step 2: Condensed view hook (mini list, non-filterable) */}
+        {criticalAndFailed.length > 0 && (
+          <div className="bg-white border-2 border-red-600 rounded-xl p-4 mb-8">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-[10px] font-black uppercase tracking-wider text-red-700">
+                Critical / Failed
+              </p>
+              <span className="text-[10px] font-bold text-red-700">
+                {criticalAndFailed.length} total
+              </span>
+            </div>
+            <div className="space-y-2">
+              {criticalPreview.map((obl) => {
+                const severity = getOblSeverity(obl);
+                const sevStyle = SEVERITY_STYLES[severity];
+                return (
+                  <div key={`critical-mini-${obl.id}`} className="flex items-center justify-between gap-2">
+                    <p className="text-[11px] font-semibold text-gray-900 truncate">
+                      {obl.title}
+                    </p>
+                    <span className={`shrink-0 px-2 py-0.5 text-[9px] font-black uppercase rounded-full ${sevStyle.badge}`}>
+                      {sevStyle.badgeText || severity.toUpperCase()}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {failedCount > 0 && (
           <div className="bg-red-700 border-2 border-red-900 rounded-xl p-4 mb-6 flex items-center gap-3">
             <XOctagon className="w-6 h-6 text-white shrink-0" />
             <div>
               <p className="text-sm text-white font-bold">
-                {failureCount} obligation{failureCount > 1 ? "s" : ""} failed. Deadline passed without verification.
+                {failedCount} obligation{failedCount > 1 ? "s" : ""} failed. Deadline passed without verification.
               </p>
               <p className="text-xs text-red-200 mt-0.5">
                 These cannot be dismissed. Attach proof or take action.
@@ -550,342 +1246,122 @@ export default function FinancialAidDashboard() {
           </div>
         )}
 
-        {/* Phase 1 Step 5: Critical banner */}
         {criticalCount > 0 && (
           <div className="bg-red-50 border-2 border-red-300 rounded-xl p-4 mb-6 flex items-center gap-3">
             <AlertTriangle className="w-5 h-5 text-red-600 shrink-0" />
             <p className="text-sm text-red-700 font-bold">
-              {criticalCount} obligation{criticalCount > 1 ? "s" : ""} critical. Deadline within 3 days.
+              {criticalCount} obligation{criticalCount > 1 ? "s" : ""} critical. Stuck with deadline within 3 days.
             </p>
           </div>
         )}
 
-        {/* Phase 1 Step 5: Urgent banner */}
-        {urgentCount > 0 && failureCount === 0 && criticalCount === 0 && (
-          <div className="bg-yellow-50 border-2 border-yellow-300 rounded-xl p-4 mb-6 flex items-center gap-3">
-            <Clock className="w-5 h-5 text-yellow-600 shrink-0" />
-            <p className="text-sm text-yellow-700 font-medium">
-              {urgentCount} obligation{urgentCount > 1 ? "s" : ""} due within 7 days.
+        {highCount > 0 && failedCount === 0 && criticalCount === 0 && (
+          <div className="bg-orange-50 border-2 border-orange-300 rounded-xl p-4 mb-6 flex items-center gap-3">
+            <AlertTriangle className="w-5 h-5 text-orange-600 shrink-0" />
+            <p className="text-sm text-orange-700 font-medium">
+              {highCount} obligation{highCount > 1 ? "s" : ""} at high severity. Deadline within 7 days.
             </p>
           </div>
         )}
 
-        {/* Obligations (canonical "things due") — Phase 1 Step 5: escalation-aware rendering */}
+        {/* Obligations - Phase 3 Step 2: Critical/Failed section, then remaining */}
         {visibleObligations.length > 0 && (
-          <div className="bg-white border-2 border-black rounded-xl p-5 mb-8">
-            <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-3">
-              Obligations
-            </h2>
-            <div className="divide-y divide-gray-100">
-              {visibleObligations.map((obl) => {
-                // Phase 1 Step 5: Compute escalation per obligation.
-                // Deterministic. No AI. Just date arithmetic and status checks.
-                const escalation = getOblEscalation(obl);
-                const style = ESCALATION_STYLES[escalation];
-                const silentFailure = isOblSilentFailure(obl);
-                const hasProof = obl.proof_required ? !proofMissingIds.has(obl.id) : true;
-                const verifyBlocked = isVerificationBlocked(escalation, obl.proof_required, hasProof);
-                const remaining = daysRemainingText(obl.deadline);
-                // Phase 2 Step 1: Dependency-blocked state.
-                // Phase 2 Step 2: Blocked state is EXPLICIT. Not subtle. Not a tooltip.
-                // If blocked, the user sees BLOCKED in the title row, the row gets a
-                // distinct visual treatment, and action guidance tells them exactly
-                // what to do. No ambiguity. No guessing.
-                const blockers = depBlockers[obl.id] || [];
-                const depBlocked = blockers.length > 0;
-                // Phase 2 Step 4: Stuck state.
-                const stuckInfo = stuckMap[obl.id] || null;
-                const isStuck = !!stuckInfo;
+          <div className="space-y-6 mb-8">
+            {criticalAndFailed.length > 0 && (
+              <div className="bg-white border-[3px] border-red-700 rounded-xl p-5">
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-sm font-black text-red-700 uppercase tracking-wider">
+                    Critical Now
+                  </h2>
+                  <span className="text-[10px] font-bold text-red-700 uppercase">
+                    {criticalAndFailed.length} total
+                  </span>
+                </div>
+                <div className="space-y-3">
+                  {criticalAndFailed.map((obl) => renderObligationRow(obl, true))}
+                </div>
+              </div>
+            )}
 
-                // Phase 2 Step 2 & 4: Row styling.
-                // Priority: stuck+escalation > escalation > stuck > blocked > normal.
-                // Stuck + escalation compounds urgency (e.g., stuck + critical = louder).
-                // Stuck alone gets an indigo treatment — distinct from all other states.
-                const rowBorder = isStuck && escalation !== "normal"
-                  ? style.rowBorder  // Escalation wins but stuck badge is visible
-                  : isStuck
-                  ? "border-l-4 border-l-indigo-500"
-                  : depBlocked && escalation === "normal"
-                  ? "border-l-4 border-l-gray-500"
-                  : style.rowBorder;
-                const rowBg = isStuck && escalation !== "normal"
-                  ? style.rowBg  // Escalation bg + stuck badge compound
-                  : isStuck
-                  ? "bg-indigo-50/60"
-                  : depBlocked && escalation === "normal"
-                  ? "bg-gray-50/70"
-                  : style.rowBg;
-
-                return (
-                  <div
-                    key={obl.id}
-                    className={`py-3 pl-3 flex items-start justify-between gap-4 rounded-lg ${rowBorder} ${rowBg}`}
-                  >
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <p className="text-sm font-semibold text-black truncate">{obl.title}</p>
-                        {/* Phase 2 Step 2: BLOCKED badge — first badge, always visible when blocked.
-                            This is NOT a tooltip. NOT an icon-only hint. It is text that says BLOCKED.
-                            The user cannot miss it. */}
-                        {depBlocked && (
-                          <span className="shrink-0 inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-black uppercase rounded-full bg-gray-700 text-white border border-gray-800">
-                            <Lock className="w-2.5 h-2.5" />
-                            BLOCKED
-                          </span>
-                        )}
-                        {/* Phase 2 Step 4: STUCK badge — structural immobility.
-                            Shown when the obligation has not progressed for STALE_DAYS
-                            and is blocked (deps, proof, or external).
-                            Distinct from BLOCKED: BLOCKED = "you have unmet deps right now."
-                            STUCK = "nothing has moved for days, and this is why." */}
-                        {isStuck && (
-                          <span className={`shrink-0 inline-flex items-center gap-1 px-2 py-0.5 text-[10px] font-black uppercase rounded-full ${
-                            stuckInfo?.is_deadlocked
-                              ? "bg-red-800 text-white border border-red-900"
-                              : "bg-indigo-700 text-white border border-indigo-800"
-                          }`}>
-                            <Pause className="w-2.5 h-2.5" />
-                            {stuckInfo?.is_deadlocked ? "DEADLOCK" : "STUCK"}
-                          </span>
-                        )}
-                        {/* Phase 1 Step 5: Escalation badge — intentionally loud */}
-                        {style.badgeText && (
-                          <span className={`shrink-0 px-2 py-0.5 text-[10px] font-black uppercase rounded-full ${style.badge}`}>
-                            {style.badgeText}
-                          </span>
-                        )}
-                      </div>
-                      <p className="text-[10px] text-gray-400 mt-0.5">
-                        {obl.type} - {obl.source}
-                      </p>
-                      {obl.proof_required && (
-                        <span className="inline-block mt-1 px-2 py-0.5 text-[10px] font-semibold uppercase rounded-full bg-amber-50 text-amber-700 border border-amber-200">
-                          Proof required
-                        </span>
-                      )}
-                      {proofMissingIds.has(obl.id) && (
-                        <span className="inline-flex items-center gap-1 mt-1 ml-1 px-2 py-0.5 text-[10px] font-semibold uppercase rounded-full bg-orange-50 text-orange-700 border border-orange-200">
-                          <MessageSquareWarning className="w-3 h-3" />
-                          Follow-up recommended
-                        </span>
-                      )}
-
-                      {/* Phase 1 Step 5: Silent failure warning — blunt language, no softening */}
-                      {silentFailure && (
-                        <div className={`mt-2 px-3 py-2 rounded-lg text-xs font-medium ${
-                          escalation === "failure"
-                            ? "bg-red-100 text-red-800 border border-red-300"
-                            : escalation === "critical"
-                            ? "bg-red-50 text-red-700 border border-red-200"
-                            : "bg-orange-50 text-orange-700 border border-orange-200"
-                        }`}>
-                          This obligation was submitted but has not been confirmed.
-                          {escalation === "failure"
-                            ? " Silent failure. Deadline has passed."
-                            : escalation === "critical"
-                            ? " Silent failure risk. Deadline imminent."
-                            : " No confirmation exists."}
-                        </div>
-                      )}
-
-                      {/* Phase 1 Step 5: Verification blocked warning */}
-                      {verifyBlocked && (
-                        <div className="mt-2 px-3 py-2 rounded-lg text-xs font-semibold bg-red-100 text-red-800 border border-red-300">
-                          Verification blocked. Proof is required at {style.badgeText} level.
-                        </div>
-                      )}
-
-                      {/* Phase 2 Step 2: Dependency-blocked warning — LEGIBLE.
-                          Three things the user must know immediately:
-                          1. This obligation IS blocked (the badge says BLOCKED)
-                          2. WHAT is blocking it (each blocker listed by name)
-                          3. WHAT ACTION unblocks it (explicit verb: "Verify X" or "Submit X")
-                          No softened language. No "might be blocked." It IS blocked. */}
-                      {depBlocked && (
-                        <div className="mt-2 px-3 py-2.5 rounded-lg text-xs font-medium bg-gray-100 text-gray-800 border-2 border-gray-400">
-                          <div className="flex items-center gap-1.5 font-bold mb-1.5 text-gray-900">
-                            <Ban className="w-3.5 h-3.5" />
-                            Blocked by {blockers.length} prerequisite{blockers.length > 1 ? "s" : ""}
-                          </div>
-                          {blockers.map((b) => {
-                            // Phase 2 Step 2: Action guidance — tell the user EXACTLY what to do.
-                            // No vague "complete this first." Explicit verbs based on current status.
-                            const action =
-                              b.status === "pending" || b.status === "blocked"
-                                ? `Submit and verify "${b.title}"`
-                                : b.status === "submitted"
-                                ? `Verify "${b.title}"`
-                                : `Complete "${b.title}"`;
-                            return (
-                              <div key={b.obligation_id} className="ml-5 mb-1.5 last:mb-0">
-                                <div className="flex items-start justify-between gap-2">
-                                  <div>
-                                    <p className="text-[11px] text-gray-700 font-semibold">
-                                      {b.type}: {b.title} — <span className="uppercase text-gray-500">{b.status}</span>
-                                    </p>
-                                    <p className="text-[10px] text-gray-600 italic">
-                                      → {action} to unblock
-                                    </p>
-                                  </div>
-                                  {/* Phase 2 Step 3: Override button — per-blocker, deliberate.
-                                      This does NOT auto-override. It opens a modal requiring
-                                      a typed reason. The button text is "Override" not "Skip"
-                                      or "Dismiss." The language is intentionally uncomfortable. */}
-                                  <button
-                                    onClick={() => {
-                                      setOverrideTarget({ obligationId: obl.id, blocker: b });
-                                      setOverrideReason("");
-                                    }}
-                                    className="shrink-0 px-2 py-0.5 text-[9px] font-semibold rounded border border-gray-300 text-gray-500 hover:text-red-600 hover:border-red-400 transition-colors"
-                                  >
-                                    Override
-                                  </button>
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      )}
-                      {/* Phase 2 Step 3: Overridden dependency indicator.
-                          Shown AFTER the blocked warning (if any remaining blockers)
-                          or standalone (if all blockers were overridden).
-                          The system remembers every override. Warnings persist.
-                          Escalation severity is NOT reduced by overrides. */}
-                      {(overriddenDeps[obl.id] || []).length > 0 && (
-                        <div className="mt-2 px-3 py-2 rounded-lg text-xs font-medium bg-amber-50 text-amber-800 border border-amber-300">
-                          <div className="flex items-center gap-1.5 font-semibold mb-1">
-                            <AlertCircle className="w-3.5 h-3.5 text-amber-600" />
-                            {(overriddenDeps[obl.id] || []).length} dependency override{(overriddenDeps[obl.id] || []).length > 1 ? "s" : ""} active
-                          </div>
-                          {(overriddenDeps[obl.id] || []).map((od) => (
-                            <p key={od.obligation_id} className="text-[10px] text-amber-700 ml-5">
-                              {od.type}: {od.title} — <span className="uppercase">{od.status}</span> (overridden)
-                            </p>
-                          ))}
-                        </div>
-                      )}
-
-                      {/* Phase 2 Step 4: Stuck reason box.
-                          Shows WHY nothing is progressing. Factual. No advice.
-                          Includes the dependency chain in plain language.
-                          Deadlocks get louder treatment.
-                          Stuck + escalation = compound urgency (both badges visible,
-                          stuck box uses escalation-aware coloring when deadline is near). */}
-                      {isStuck && stuckInfo && (
-                        <div className={`mt-2 px-3 py-2.5 rounded-lg text-xs font-medium border ${
-                          stuckInfo.is_deadlocked
-                            ? "bg-red-100 text-red-900 border-red-400"
-                            : escalation === "failure" || escalation === "critical"
-                            ? "bg-red-50 text-red-800 border-red-300"
-                            : escalation === "urgent"
-                            ? "bg-yellow-50 text-yellow-900 border-yellow-300"
-                            : "bg-indigo-50 text-indigo-900 border-indigo-300"
-                        }`}>
-                          <div className="flex items-center gap-1.5 font-bold mb-1">
-                            <Pause className="w-3.5 h-3.5 shrink-0" />
-                            {stuckInfo.is_deadlocked
-                              ? "Dependency deadlock. Unresolvable by user."
-                              : `No progress for ${stuckInfo.days_stale} day${stuckInfo.days_stale !== 1 ? "s" : ""}`}
-                          </div>
-                          <p className="text-[11px] mb-1">
-                            {STUCK_REASON_TEXT[stuckInfo.stuck_reason || ""] || stuckInfo.stuck_reason}
-                          </p>
-                          {stuckInfo.chain.length > 0 && (
-                            <div className="mt-1.5 pt-1.5 border-t border-current/10">
-                              <p className="text-[10px] font-semibold uppercase mb-0.5 opacity-70">
-                                Dependency chain
-                              </p>
-                              <p className="text-[10px] font-mono">
-                                {obl.type}
-                                {stuckInfo.chain.map((link, i) => (
-                                  <span key={link.obligation_id}>
-                                    {" → "}
-                                    {link.type} ({link.status})
-                                    {link.is_cycle_back && (
-                                      <span className="font-bold text-red-600"> ← CYCLE</span>
-                                    )}
-                                  </span>
-                                ))}
-                              </p>
-                            </div>
-                          )}
-                          {stuckInfo.stuck_since && (
-                            <p className="text-[9px] mt-1 opacity-60">
-                              Stuck since {new Date(stuckInfo.stuck_since).toLocaleDateString()}
-                            </p>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                    <div className="text-right shrink-0">
-                      <p className={`text-xs font-medium ${style.deadlineColor}`}>
-                        {obl.deadline ? new Date(obl.deadline).toLocaleDateString() : "No deadline"}
-                      </p>
-                      {/* Phase 1 Step 5: Show days remaining — no sugar coating */}
-                      {remaining && (
-                        <p className={`text-[10px] font-semibold mt-0.5 ${style.deadlineColor}`}>
-                          {remaining}
-                        </p>
-                      )}
-                      <p className={`text-[10px] font-semibold uppercase mt-0.5 ${style.statusColor}`}>
-                        {obl.status}
-                      </p>
-                      <div className="mt-2 flex items-center justify-end gap-2 flex-wrap">
-                        {obl.proof_required && obl.status !== "verified" && (
-                          <button
-                            onClick={() => attachManualProof(obl.id)}
-                            disabled={busyObligationId === obl.id}
-                            className={`px-2.5 py-1 text-[10px] font-semibold rounded-lg border transition-colors disabled:opacity-50 ${
-                              escalation === "critical" || escalation === "failure"
-                                ? "border-red-400 text-red-700 hover:border-red-600 hover:bg-red-50 font-bold"
-                                : "border-gray-200 text-gray-600 hover:border-black hover:text-black"
-                            }`}
-                            title="Attach proof (append-only)"
-                          >
-                            Proof
-                          </button>
-                        )}
-                        {(obl.status === "pending" || obl.status === "blocked") && !depBlocked && (
-                          <button
-                            onClick={() => setObligationStatus(obl.id, "submitted", obl.proof_required)}
-                            disabled={busyObligationId === obl.id}
-                            className="px-2.5 py-1 text-[10px] font-semibold rounded-lg bg-black text-white hover:bg-gray-800 disabled:opacity-50 transition-colors"
-                          >
-                            Submitted
-                          </button>
-                        )}
-                        {obl.status === "submitted" && !verifyBlocked && !depBlocked && (
-                          <button
-                            onClick={() => setObligationStatus(obl.id, "verified", obl.proof_required)}
-                            disabled={busyObligationId === obl.id}
-                            className="px-2.5 py-1 text-[10px] font-semibold rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors"
-                            title={obl.proof_required ? "Blocked without proof" : "Mark verified"}
-                          >
-                            Verify
-                          </button>
-                        )}
-                        {proofMissingIds.has(obl.id) && (
-                          <button
-                            onClick={() => handleGenerateFollowUp(obl.id)}
-                            disabled={generatingFollowUp === obl.id}
-                            className="px-2.5 py-1 text-[10px] font-semibold rounded-lg bg-orange-600 text-white hover:bg-orange-700 disabled:opacity-50 transition-colors"
-                            title="Generate a follow-up email draft (requires your approval before sending)"
-                          >
-                            {generatingFollowUp === obl.id ? (
-                              <Loader2 className="w-3 h-3 animate-spin inline" />
-                            ) : (
-                              "Follow-up"
-                            )}
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
+            <div className="bg-white border-2 border-black rounded-xl p-5">
+              <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-3">
+                Obligations
+              </h2>
+              <div className="divide-y divide-gray-100">
+                {visibleRest.map((obl) => renderObligationRow(obl))}
+              </div>
             </div>
           </div>
         )}
+
+        
+
+        {/* Phase 6: Non-Cooperative Inputs (minimal intake) */}
+        <div className="bg-white border-2 border-black rounded-xl p-5 mb-8">
+          <h2 className="text-sm font-semibold text-gray-500 uppercase tracking-wider mb-3">
+            Intake
+          </h2>
+          <div className="space-y-4">
+            <div>
+              <p className="text-xs font-semibold text-gray-700 mb-1">Portal Paste Intake</p>
+              <textarea
+                value={portalText}
+                onChange={(e) => setPortalText(e.target.value)}
+                className="w-full border border-gray-300 rounded-md p-2 text-sm"
+                rows={4}
+                placeholder="Paste portal text here"
+              />
+              <button
+                onClick={handlePortalPaste}
+                disabled={intakeLoading || !portalText.trim()}
+                className="mt-2 px-3 py-1.5 text-xs font-semibold rounded border border-gray-300 text-gray-700 hover:border-black disabled:opacity-50"
+              >
+                Extract
+              </button>
+            </div>
+
+            <div>
+              <p className="text-xs font-semibold text-gray-700 mb-1">Upload Screenshot/PDF (OCR Intake)</p>
+              <input
+                type="file"
+                onChange={(e) => e.target.files && handleOcrUpload(e.target.files[0])}
+                className="text-xs"
+              />
+            </div>
+
+            {intakeError && (
+              <p className="text-xs text-red-600">{intakeError}</p>
+            )}
+
+            {intakeDraft && (
+              <div className="border border-gray-200 rounded-md p-3 text-xs">
+                <p className="font-semibold text-gray-700 mb-2">Extraction Candidate</p>
+                <div className="space-y-1">
+                  <div>Type: {intakeDraft.extraction.obligation_type_candidate || 'Unknown'}</div>
+                  <div>Institution: {intakeDraft.extraction.institution_candidate || 'Unknown'}</div>
+                  <div>Deadline: {intakeDraft.extraction.deadline_candidate || 'Unknown'}</div>
+                  <div>Confidence: {intakeDraft.extraction.confidence}</div>
+                </div>
+                <div className="mt-2 flex items-center gap-2">
+                  <button
+                    onClick={handleIntakeConfirm}
+                    disabled={intakeLoading}
+                    className="px-3 py-1.5 text-xs font-semibold rounded bg-black text-white disabled:opacity-50"
+                  >
+                    Confirm
+                  </button>
+                  <button
+                    onClick={handleIntakeDiscard}
+                    disabled={intakeLoading}
+                    className="px-3 py-1.5 text-xs font-semibold rounded border border-gray-300 text-gray-700 disabled:opacity-50"
+                  >
+                    Discard
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
 
         {/* Schools */}
         <div className="flex items-center justify-between mb-4">

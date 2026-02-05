@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { createSupabaseBrowser } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/supabase/auth-provider";
+import type { SeverityLevel, SeverityReason } from "@/lib/severity";
 
 // Phase 2 Step 1: Extended obligation types to support dependency graph.
 // New types: ACCEPTANCE, SCHOLARSHIP_DISBURSEMENT, ENROLLMENT.
@@ -13,13 +14,15 @@ export type ObligationType =
   | "APPLICATION_SUBMISSION"
   | "HOUSING_DEPOSIT"
   | "SCHOLARSHIP"
+  | "ENROLLMENT_DEPOSIT"
+  | "SCHOLARSHIP_ACCEPTANCE"
   | "ACCEPTANCE"
   | "SCHOLARSHIP_DISBURSEMENT"
   | "ENROLLMENT";
 
 export type ObligationSource = "email" | "manual";
 
-export type ObligationStatus = "pending" | "submitted" | "verified" | "blocked";
+export type ObligationStatus = "pending" | "submitted" | "verified" | "blocked" | "failed";
 
 // Phase 2 Step 1: Blocker info returned by dependency evaluation endpoint.
 export interface ObligationBlocker {
@@ -27,6 +30,8 @@ export interface ObligationBlocker {
   type: string;
   title: string;
   status: string;
+  institution?: string | null;
+  deadline?: string | null;
 }
 
 // Phase 2 Step 3: Override record. Immutable. Append-only.
@@ -54,6 +59,9 @@ export interface OverriddenDep {
   type: string;
   title: string;
   status: string;
+  created_at?: string | null;
+  institution?: string | null;
+  deadline?: string | null;
 }
 
 export interface ObligationRow {
@@ -68,11 +76,19 @@ export interface ObligationRow {
   proof_required: boolean;
   created_at: string;
   updated_at: string;
+  failed_at?: string | null;
+  verified_at?: string | null;
+  prior_failed_obligation_id?: string | null;
   // Phase 2 Step 4: Stuck state. System-derived. Not user-editable.
   stuck?: boolean;
   stuck_reason?: StuckReason | null;
   stuck_since?: string | null;
   status_changed_at?: string;
+  // Phase 3 Step 1: Severity. System-derived. Not user-editable.
+  // Drives visual treatment (badges, row colors). Separate from escalation (behavioral).
+  severity?: SeverityLevel;
+  severity_since?: string | null;
+  severity_reason?: SeverityReason | null;
 }
 
 // Phase 2 Step 4: Stuck reason taxonomy. Exact list. No additions.
@@ -86,6 +102,7 @@ export type StuckReason =
 
 // Phase 2 Step 4: Stuck info returned by the stuck detection endpoint.
 // Includes the full chain trace for UI display.
+// Phase 3 Step 1: Extended with severity fields.
 export interface StuckInfo {
   obligation_id: string;
   stuck: boolean;
@@ -94,6 +111,10 @@ export interface StuckInfo {
   is_deadlocked: boolean;
   days_stale: number;
   chain: StuckChainLink[];
+  // Phase 3 Step 1: Severity from the stuck detection endpoint
+  severity?: SeverityLevel;
+  severity_reason?: SeverityReason;
+  severity_since?: string | null;
 }
 
 // Phase 2 Step 4: A single link in a dependency chain trace.
@@ -145,4 +166,3 @@ export function useObligations() {
 
   return { obligations, loading, error, refresh: fetchObligations };
 }
-

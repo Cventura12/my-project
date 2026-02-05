@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/supabase/auth-provider";
 import { useEmails, AnalyzedEmail } from "@/lib/hooks/useEmails";
 import EmailCard from "@/components/financial-aid/EmailCard";
+import CriticalOblBar from "@/components/financial-aid/CriticalOblBar";
 import {
   ArrowLeft,
   Mail,
@@ -132,6 +133,10 @@ export default function EmailsPage() {
           </div>
         </div>
       </header>
+
+      {/* Phase 3 Step 2: Cross-context visibility.
+          Critical/failed obligations are visible on EVERY main screen. */}
+      <CriticalOblBar />
 
       <main className="max-w-3xl mx-auto px-4 sm:px-6 py-8">
         {/* Scan controls */}
