@@ -19,8 +19,7 @@ export default function ApprovalsPage() {
     setError(null);
     try {
       const res = await listDrafts(currentUserId);
-      const list = res?.drafts || res?.data || res || [];
-      setDrafts(list);
+      setDrafts(res.drafts ?? []);
     } catch (e: any) {
       setError(e?.message || "Failed to load drafts");
     } finally {
