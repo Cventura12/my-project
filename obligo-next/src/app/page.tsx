@@ -50,9 +50,6 @@ export default function LandingPage() {
       {/* Hero */}
       <section className="relative z-10 max-w-5xl mx-auto px-6 pt-20 pb-16">
         <div className="max-w-3xl">
-          <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-            Obligo
-          </p>
           <h1
             className="mt-3 text-4xl sm:text-6xl font-semibold tracking-tight text-foreground"
             style={{ fontFamily: "\"Playfair Display\", \"Georgia\", serif" }}
