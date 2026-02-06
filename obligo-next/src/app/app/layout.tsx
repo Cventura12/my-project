@@ -32,15 +32,9 @@ function AppShellInner({ children }: { children: ReactNode }) {
     <div className="min-h-screen bg-background">
       <header className="bg-background border-b border-border/60">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg border border-gray-200 flex items-center justify-center font-black text-xs">
-              O
-            </div>
-            <div>
-              <p className="text-[10px] tracking-widest font-semibold text-gray-400 uppercase">Obligo</p>
-              <p className="text-sm font-bold text-black">App v2</p>
-            </div>
-          </div>
+          <Link href="/" className="text-sm font-semibold tracking-tight text-foreground">
+            Obligo
+          </Link>
           <button
             onClick={() => setNavOpen((v) => !v)}
             className="md:hidden px-3 py-2 text-xs font-semibold rounded-lg border border-gray-200 text-gray-700"
