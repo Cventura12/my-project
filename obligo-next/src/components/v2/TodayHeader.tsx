@@ -1,7 +1,6 @@
 "use client";
 
 import { useMemo } from "react";
-import { PageTitle, SectionTitle } from "@/components/ui/Page";
 import { UIObligationSummary } from "@/types/ui";
 
 export default function TodayHeader({ items }: { items: UIObligationSummary[] }) {
@@ -18,25 +17,21 @@ export default function TodayHeader({ items }: { items: UIObligationSummary[] })
   return (
     <div className="space-y-4">
       <div className="space-y-2">
-        <SectionTitle>Command Center</SectionTitle>
-        <PageTitle>Today</PageTitle>
+        <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
+          Command Center
+        </p>
+        <h1 className="text-3xl font-semibold tracking-tight text-black">Today</h1>
       </div>
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <span className="px-2 py-1 rounded-full border bg-red-100 text-red-800 border-red-300">
+        <span className="px-2 py-1 rounded-full border bg-red-50 text-red-700 border-red-200">
           {counts.critical} Critical
         </span>
-        <span className="px-2 py-1 rounded-full border bg-orange-100 text-orange-800 border-orange-300">
+        <span className="px-2 py-1 rounded-full border bg-orange-50 text-orange-700 border-orange-200">
           {counts.high} High
         </span>
-        <span className="px-2 py-1 rounded-full border bg-gray-100 text-gray-700 border-gray-200">
+        <span className="px-2 py-1 rounded-full border bg-gray-50 text-gray-700 border-gray-200">
           {counts.normal} Normal
         </span>
-        <input
-          type="text"
-          placeholder="Search (coming soon)"
-          className="ml-auto px-3 py-1.5 text-xs border border-gray-200 rounded-lg focus:outline-none focus:border-black"
-          disabled
-        />
       </div>
     </div>
   );

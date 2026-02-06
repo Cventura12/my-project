@@ -7,6 +7,7 @@ import { groupTodayObligations } from "@/lib/todayGrouping";
 import { UIObligationSummary } from "@/types/ui";
 import TodayHeader from "@/components/v2/TodayHeader";
 import ObligationSection from "@/components/v2/ObligationSection";
+import NowCard from "@/components/v2/NowCard";
 import { ErrorState, Skeleton } from "@/components/ui/Page";
 import { useAuth } from "@/lib/supabase/auth-provider";
 
@@ -72,13 +73,17 @@ export default function TodayPage() {
     return <ErrorState message={error} onRetry={load} />;
   }
 
+  const nowItem = groups.atRisk[0];
+
   return (
-    <div className="space-y-6">
+    <div className="mx-auto max-w-5xl px-6 py-8 space-y-6">
       <TodayHeader items={items} />
+
+      {nowItem && <NowCard item={nowItem} />}
 
       <ObligationSection title="At Risk" items={groups.atRisk} />
       <ObligationSection title="Blocked" items={groups.blocked} />
-      <ObligationSection title="Unverified" items={groups.unverified} />
+      <ObligationSection title="Unverified" items={groups.unverified} collapsible defaultCollapsed />
       <ObligationSection title="Everything Else" items={groups.other} collapsible defaultCollapsed />
     </div>
   );
