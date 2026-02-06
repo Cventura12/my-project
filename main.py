@@ -1068,7 +1068,7 @@ async def gmail_oauth_callback(code: str = None, error: str = None, state: Optio
 
             upsert_res = sb.table("email_connections").upsert(
                 upsert_payload,
-                on_conflict="user_id",
+                on_conflict="user_id,provider",
             ).execute()
             if getattr(upsert_res, "error", None):
                 logger.error(
