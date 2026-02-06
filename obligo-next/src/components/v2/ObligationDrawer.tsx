@@ -290,7 +290,11 @@ export default function ObligationDrawer({
           <EmailDraftModal
             draft={selectedDraft}
             onClose={() => setSelectedDraft(null)}
-            onImprove={(id, feedback) => improveDraft({ user_id: userId!, follow_up_id: id, feedback })}
+            onImprove={(id, feedback) =>
+              improveDraft({ user_id: userId!, follow_up_id: id, feedback }).then(
+                (r) => r?.content ?? null
+              )
+            }
             onSend={(id, editedContent, editedSubject) =>
               sendDraft({ user_id: userId!, follow_up_id: id, edited_content: editedContent, edited_subject: editedSubject })
                 .then(() => true)
