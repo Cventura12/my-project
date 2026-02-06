@@ -4,6 +4,25 @@
 
 @layer base {
   :root {
+    --font-xs: 0.75rem;
+    --font-sm: 0.875rem;
+    --font-base: 1rem;
+    --font-lg: 1.125rem;
+    --font-xl: 1.25rem;
+    --font-2xl: 1.5rem;
+
+    --space-2: 0.5rem;
+    --space-3: 0.75rem;
+    --space-4: 1rem;
+    --space-6: 1.5rem;
+    --space-8: 2rem;
+    --space-12: 3rem;
+    --space-16: 4rem;
+
+    --radius-md: 10px;
+    --radius-lg: 12px;
+    --radius-xl: 16px;
+
     --background: 0 0% 100%;
     --foreground: 222.2 84% 4.9%;
 

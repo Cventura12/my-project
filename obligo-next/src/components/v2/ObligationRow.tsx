@@ -3,6 +3,7 @@
 import { UIObligationSummary } from "@/types/ui";
 import { useSelection } from "./selection";
 import { STATUS_LABELS } from "@/lib/copy";
+import { Badge, Button } from "@/components/ui/Page";
 
 function formatDeadline(deadline: Date | null) {
   if (!deadline) return { primary: "No deadline", secondary: "" };
@@ -31,13 +32,14 @@ export default function ObligationRow({ item }: { item: UIObligationSummary }) {
   const due = formatDeadline(item.deadline);
 
   return (
-    <button
+    <Button
       onClick={() => openDrawer(item.id)}
-      className="w-full text-left px-4 py-3 hover:bg-muted/40 transition-colors"
+      variant="ghost"
+      className="w-full text-left px-4 py-3 justify-start"
     >
-      <div className="flex items-start justify-between gap-4">
+      <div className="flex items-start justify-between gap-4 w-full">
         <div className="min-w-0">
-          <p className="text-sm font-medium text-black truncate">{item.title}</p>
+          <p className="text-sm font-medium text-foreground truncate">{item.title}</p>
           <p className="text-xs text-muted-foreground mt-1 truncate">{item.schoolName}</p>
         </div>
         <div className="text-right text-xs">
@@ -47,11 +49,9 @@ export default function ObligationRow({ item }: { item: UIObligationSummary }) {
       </div>
 
       <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-        <span className="px-2 py-0.5 rounded-full border bg-amber-500/10 text-amber-800 border-amber-500/20">
-          {primaryTruth(item)}
-        </span>
+        <Badge variant="proof">{primaryTruth(item)}</Badge>
         <span className="text-muted-foreground truncate">{item.reasonLine}</span>
       </div>
-    </button>
+    </Button>
   );
 }

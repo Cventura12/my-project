@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { ErrorState, PageTitle, Skeleton } from "@/components/ui/Page";
+import { Badge, EmptyState, ErrorState, SectionHeader, Skeleton } from "@/components/ui/Page";
 import { useAuth } from "@/lib/supabase/auth-provider";
 import { useSchools } from "@/lib/hooks/useSchools";
 import { getObligations } from "@/api/obligations";
@@ -163,15 +163,15 @@ export default function SchoolsPage() {
 
   return (
     <div className="space-y-6">
-      <div className="space-y-2">
-        <PageTitle>{NAV_LABELS.schools}</PageTitle>
-        <p className="text-sm text-muted-foreground">Institution context for your obligations.</p>
-      </div>
+      <SectionHeader
+        title={NAV_LABELS.schools}
+        subtitle="Institution context for your obligations."
+      />
 
       {schools.length === 0 && !hasUnassigned && (
-        <div className="border border-border/60 rounded-xl p-4">
+        <EmptyState>
           <p className="text-sm text-muted-foreground whitespace-pre-line">{EMPTY_STATES.schools}</p>
-        </div>
+        </EmptyState>
       )}
 
       {schools.length > 0 && (
@@ -185,11 +185,11 @@ export default function SchoolsPage() {
               <div className="flex flex-wrap items-center justify-between gap-4">
                 <div>
                   <div className="text-sm font-semibold text-foreground">{row.school.name}</div>
-                  <div className="text-xs text-muted-foreground">Unresolved: {row.counts.unresolved}</div>
-                </div>
-                <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
-                  <span>Blocked: {row.counts.blocked}</span>
-                  <span>Verification missing: {row.counts.verificationMissing}</span>
+                <div className="text-xs text-muted-foreground">Unresolved: {row.counts.unresolved}</div>
+              </div>
+                <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+                  <Badge variant="neutral">Blocked: {row.counts.blocked}</Badge>
+                  <Badge variant="proof">Verification missing: {row.counts.verificationMissing}</Badge>
                 </div>
               </div>
             </Link>
@@ -211,9 +211,9 @@ export default function SchoolsPage() {
                 <div className="text-sm font-semibold text-foreground">Unassigned to school</div>
                 <div className="text-xs text-muted-foreground">Unresolved: {unassignedCounts.unresolved}</div>
               </div>
-              <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
-                <span>Blocked: {unassignedCounts.blocked}</span>
-                <span>Verification missing: {unassignedCounts.verificationMissing}</span>
+              <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+                <Badge variant="neutral">Blocked: {unassignedCounts.blocked}</Badge>
+                <Badge variant="proof">Verification missing: {unassignedCounts.verificationMissing}</Badge>
               </div>
             </div>
           </Link>

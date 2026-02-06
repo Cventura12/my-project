@@ -3,7 +3,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { ErrorState, PageTitle, SectionTitle, Skeleton } from "@/components/ui/Page";
+import {
+  Button,
+  EmptyState,
+  ErrorState,
+  SectionHeader,
+  SectionTitle,
+  Skeleton,
+} from "@/components/ui/Page";
 import { useAuth } from "@/lib/supabase/auth-provider";
 import { useSchools } from "@/lib/hooks/useSchools";
 import { getObligations } from "@/api/obligations";
@@ -201,20 +208,21 @@ export default function SchoolDetailPage() {
 
   return (
     <div className="space-y-6">
-      <div className="space-y-2">
-        <SectionTitle>School</SectionTitle>
-        <PageTitle>{schoolName}</PageTitle>
-        <p className="text-sm text-muted-foreground">
-          {counts.unresolved} unresolved - {counts.blocked} blocked - {counts.verificationMissing} verification missing
-        </p>
-      </div>
+      <SectionHeader
+        title={schoolName}
+        subtitle={
+          <span>
+            {counts.unresolved} unresolved - {counts.blocked} blocked - {counts.verificationMissing} verification missing
+          </span>
+        }
+      />
 
       <section className="space-y-3">
         <SectionTitle>Unresolved requirements</SectionTitle>
         {unresolved.length === 0 ? (
-          <div className="border border-border/60 rounded-xl p-4">
+          <EmptyState>
             <p className="text-sm text-muted-foreground">No unresolved requirements recorded.</p>
-          </div>
+          </EmptyState>
         ) : (
           <div className="space-y-3">
             {unresolved.map((obl) => (
@@ -233,12 +241,9 @@ export default function SchoolDetailPage() {
                 {whyItMatters(obl) && (
                   <div className="text-xs text-muted-foreground mt-2">{whyItMatters(obl)}</div>
                 )}
-                <button
-                  onClick={() => openDrawer(obl.id)}
-                  className="mt-2 text-xs font-semibold text-foreground underline"
-                >
+                <Button onClick={() => openDrawer(obl.id)} variant="ghost" size="sm" className="mt-2">
                   View obligation detail
-                </button>
+                </Button>
               </div>
             ))}
           </div>
@@ -248,9 +253,9 @@ export default function SchoolDetailPage() {
       <section className="space-y-3">
         <SectionTitle>Blocked</SectionTitle>
         {blocked.length === 0 ? (
-          <div className="border border-border/60 rounded-xl p-4">
+          <EmptyState>
             <p className="text-sm text-muted-foreground">No blocked requirements recorded.</p>
-          </div>
+          </EmptyState>
         ) : (
           <div className="space-y-3">
             {blocked.map((obl) => {
@@ -273,12 +278,9 @@ export default function SchoolDetailPage() {
                     </div>
                   </div>
                   <div className="text-xs text-muted-foreground mt-2">{blockedLine}</div>
-                  <button
-                    onClick={() => openDrawer(obl.id)}
-                    className="mt-2 text-xs font-semibold text-foreground underline"
-                  >
+                  <Button onClick={() => openDrawer(obl.id)} variant="ghost" size="sm" className="mt-2">
                     View obligation detail
-                  </button>
+                  </Button>
                 </div>
               );
             })}

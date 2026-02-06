@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { ErrorState, MetaText, PageTitle, Skeleton } from "@/components/ui/Page";
+import { EmptyState, ErrorState, SectionHeader, Skeleton } from "@/components/ui/Page";
 import ApprovalsQueue from "@/components/v2/approvals/ApprovalsQueue";
 import EmailDraftModal from "@/components/financial-aid/EmailDraftModal";
 import { listDrafts, improveDraft, sendDraft, cancelDraft } from "@/api/approvals";
@@ -96,10 +96,10 @@ export default function ApprovalsPage() {
 
   return (
     <div className="space-y-6">
-      <div className="space-y-1">
-        <PageTitle>{NAV_LABELS.approvals}</PageTitle>
-        <MetaText>Review and approve outbound follow-ups before they’re sent.</MetaText>
-      </div>
+      <SectionHeader
+        title={NAV_LABELS.approvals}
+        subtitle="Review and approve outbound follow-ups before they are sent."
+      />
 
       {loading ? (
         <div className="space-y-3">
@@ -110,9 +110,9 @@ export default function ApprovalsPage() {
       ) : error ? (
         <ErrorState message={error} onRetry={() => load(user.id)} />
       ) : pending.length === 0 ? (
-        <div className="bg-gray-50 border border-dashed border-gray-200 rounded-xl p-6 text-center">
-          <p className="text-sm text-gray-600 whitespace-pre-line">{EMPTY_STATES.approvals}</p>
-        </div>
+        <EmptyState>
+          <p className="text-sm text-muted-foreground whitespace-pre-line">{EMPTY_STATES.approvals}</p>
+        </EmptyState>
       ) : (
         <ApprovalsQueue drafts={pending} onOpen={(draft) => setSelected(draft)} />
       )}

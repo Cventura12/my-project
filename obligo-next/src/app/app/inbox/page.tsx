@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { EmptyState, ErrorState, MetaText, PageTitle, Skeleton } from "@/components/ui/Page";
-import { NAV_LABELS, EMPTY_STATES, BUTTON_LABELS } from "@/lib/copy";
+import { Badge, Button, EmptyState, ErrorState, SectionHeader, Skeleton } from "@/components/ui/Page";
+import { NAV_LABELS, EMPTY_STATES } from "@/lib/copy";
 import SignalsList from "@/components/v2/inbox/SignalsList";
 import SignalDrawer from "@/components/v2/inbox/SignalDrawer";
 import { getEmailConnection, listSignals, scanEmail, dismissEmail } from "@/api/inbox";
@@ -104,40 +104,27 @@ export default function InboxV2Page() {
   return (
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
-        <div className="space-y-1">
-          <PageTitle>{NAV_LABELS.inbox}</PageTitle>
-          <MetaText>Signals that may require an obligation, proof, or follow-up.</MetaText>
-        </div>
+        <SectionHeader
+          title={NAV_LABELS.inbox}
+          subtitle="Signals that may require an obligation, proof, or follow-up."
+        />
         <div className="flex items-center gap-2">
-          <span
-            className={`px-2.5 py-1 rounded-full text-xs border ${
-              connection.connected
-                ? "bg-emerald-50 text-emerald-700 border-emerald-200"
-                : "bg-gray-100 text-gray-600 border-gray-200"
-            }`}
-          >
-            {connection.connected ? (
-              <span className="inline-flex items-center gap-1">
-                <Wifi className="w-3 h-3" />
-                Connected
-              </span>
-            ) : (
-              <span className="inline-flex items-center gap-1">
-                <WifiOff className="w-3 h-3" />
-                Not connected
-              </span>
-            )}
-          </span>
-          <button
+          <Badge variant={connection.connected ? "success" : "neutral"}>
+            <span className="inline-flex items-center gap-1">
+              {connection.connected ? <Wifi className="w-3 h-3" /> : <WifiOff className="w-3 h-3" />}
+              {connection.connected ? "Connected" : "Not connected"}
+            </span>
+          </Badge>
+          <Button
             onClick={handleScan}
             disabled={!connection.connected || scanning}
-            className="px-4 py-2 text-sm font-semibold rounded-lg bg-black text-white hover:bg-gray-800 disabled:opacity-50"
+            variant="primary"
           >
             <span className="inline-flex items-center gap-2">
               <RefreshCw className={`w-4 h-4 ${scanning ? "animate-spin" : ""}`} />
               Scan email
             </span>
-          </button>
+          </Button>
         </div>
       </div>
 
@@ -146,9 +133,9 @@ export default function InboxV2Page() {
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="Search signals"
-          className="px-3 py-2 text-sm border border-gray-200 rounded-lg focus:outline-none focus:border-black"
+          className="px-3 py-2 text-sm border border-border/60 rounded-lg focus:outline-none focus:border-border"
         />
-        <label className="text-xs text-gray-600 inline-flex items-center gap-2">
+        <label className="text-xs text-muted-foreground inline-flex items-center gap-2">
           <input
             type="checkbox"
             checked={actionableOnly}
@@ -168,29 +155,32 @@ export default function InboxV2Page() {
         <ErrorState message={error} onRetry={() => load(user.id)} />
       ) : !connection.connected ? (
         <EmptyState>
-          <Mail className="w-8 h-8 text-gray-300 mx-auto mb-3" />
-          <p className="text-sm text-gray-600">Not connected to Gmail.</p>
-          <a
-            href={`${API_BASE}/oauth/gmail?user_id=${encodeURIComponent(user.id)}`}
-            className="inline-block mt-3 px-4 py-2 text-sm font-semibold rounded-lg bg-black text-white hover:bg-gray-800"
-          >
-            Connect Gmail
-          </a>
+          <Mail className="w-8 h-8 text-muted-foreground/50 mx-auto mb-3" />
+          <p className="text-sm text-muted-foreground">Not connected to Gmail.</p>
+          <div className="mt-3">
+            <Button
+              variant="primary"
+              onClick={() => {
+                window.location.href = `${API_BASE}/oauth/gmail?user_id=${encodeURIComponent(user.id)}`;
+              }}
+            >
+              Connect Gmail
+            </Button>
+          </div>
         </EmptyState>
       ) : signals.length === 0 ? (
         <EmptyState>
-          <Inbox className="w-8 h-8 text-gray-300 mx-auto mb-3" />
-          <p className="text-sm text-gray-600 whitespace-pre-line">{EMPTY_STATES.inbox}</p>
-          <button
-            onClick={handleScan}
-            className="inline-block mt-3 px-4 py-2 text-sm font-semibold rounded-lg bg-black text-white hover:bg-gray-800"
-          >
-            Scan email
-          </button>
+          <Inbox className="w-8 h-8 text-muted-foreground/50 mx-auto mb-3" />
+          <p className="text-sm text-muted-foreground whitespace-pre-line">{EMPTY_STATES.inbox}</p>
+          <div className="mt-3">
+            <Button onClick={handleScan} variant="primary">
+              Scan email
+            </Button>
+          </div>
         </EmptyState>
       ) : filtered.length === 0 ? (
         <EmptyState>
-          <p className="text-sm text-gray-500">No matches.</p>
+          <p className="text-sm text-muted-foreground">No matches.</p>
         </EmptyState>
       ) : (
         <SignalsList

@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { gsap } from "gsap";
 import Drawer from "@/components/Drawer";
-import { ErrorState, Skeleton } from "@/components/ui/Page";
+import { Badge, Button, ErrorState, Skeleton } from "@/components/ui/Page";
 import {
   getDependencies,
   getObligations,
@@ -70,6 +71,7 @@ export default function ObligationDrawer({
   const [state, setState] = useState<DrawerState>({ status: "idle" });
   const [selectedDraft, setSelectedDraft] = useState<any | null>(null);
   const verificationRef = useRef<HTMLDivElement | null>(null);
+  const [reducedMotion, setReducedMotion] = useState(false);
 
   const load = async () => {
     if (!userId || !obligationId) {
@@ -162,6 +164,15 @@ export default function ObligationDrawer({
     };
   }, [userId, obligationId]);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const update = () => setReducedMotion(media.matches);
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
   const drawerOpen = !!obligationId;
 
   const content = useMemo(() => {
@@ -234,6 +245,14 @@ export default function ObligationDrawer({
         type,
         source_ref: sourceRef,
       });
+      await load();
+      if (!reducedMotion && verificationRef.current) {
+        gsap.fromTo(
+          verificationRef.current,
+          { opacity: 0.6, y: 6 },
+          { opacity: 1, y: 0, duration: 0.2, ease: "power1.out" }
+        );
+      }
     };
 
     const handleVerificationAction = () => {
@@ -274,9 +293,11 @@ export default function ObligationDrawer({
           <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Status</div>
           <div className="text-2xl font-semibold text-foreground">{statusLabel()}</div>
           <p className="text-sm text-muted-foreground">{statusMeaning()}</p>
-          <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
-            <span>Severity: {detail.severity.toUpperCase()}</span>
-            <span>{dueLine}{dueIn !== null ? ` - Due in ${dueIn} days` : ""}</span>
+          <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+            <Badge variant="neutral">Severity: {detail.severity.toUpperCase()}</Badge>
+            <Badge variant="neutral">
+              {dueLine}{dueIn !== null ? ` - Due in ${dueIn} days` : ""}
+            </Badge>
           </div>
         </section>
 
@@ -301,12 +322,9 @@ export default function ObligationDrawer({
           ) : (
             <div className="text-xs text-muted-foreground">No proofs attached.</div>
           )}
-          <button
-            onClick={handleVerificationAction}
-            className="w-full px-4 py-2 text-sm font-semibold rounded-lg border border-border/60 hover:bg-muted/40"
-          >
+          <Button onClick={handleVerificationAction} variant="secondary" className="w-full">
             {verificationActionLabel}
-          </button>
+          </Button>
         </section>
 
         {/* D) Dependencies */}
@@ -384,13 +402,14 @@ export default function ObligationDrawer({
                   <p className="text-[10px] text-muted-foreground">Status: {d.status}</p>
                   {d.status === "pending_approval" && (
                     <div className="mt-2 flex flex-wrap gap-2">
-                      <button
+                      <Button
                         onClick={() => setSelectedDraft(d)}
-                        className="px-3 py-2 text-xs font-semibold rounded-lg border border-border/60 hover:bg-muted/40"
+                        variant="secondary"
+                        size="sm"
                       >
                         Edit
-                      </button>
-                      <button
+                      </Button>
+                      <Button
                         onClick={() =>
                           sendDraft({
                             user_id: userId!,
@@ -399,16 +418,18 @@ export default function ObligationDrawer({
                             edited_subject: d.subject || null,
                           })
                         }
-                        className="px-3 py-2 text-xs font-semibold rounded-lg border border-border/60 hover:bg-muted/40"
+                        variant="secondary"
+                        size="sm"
                       >
                         Approve & Send
-                      </button>
-                      <button
+                      </Button>
+                      <Button
                         onClick={() => cancelDraft({ user_id: userId!, follow_up_id: d.id })}
-                        className="px-3 py-2 text-xs font-semibold rounded-lg border border-border/60 hover:bg-muted/40"
+                        variant="ghost"
+                        size="sm"
                       >
                         Cancel
-                      </button>
+                      </Button>
                     </div>
                   )}
                 </div>

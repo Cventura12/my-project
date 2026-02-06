@@ -1,142 +1,121 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import Link from "next/link";
-import { NAV_LABELS } from "@/lib/copy";
-import {
-  ArrowRight,
-  Inbox,
-  ClipboardCheck,
-  ShieldCheck,
-  Sparkles,
-  FileCheck2,
-  BellRing,
-} from "lucide-react";
+import { Button } from "@/components/ui/Page";
 
 export default function LandingPage() {
   const router = useRouter();
 
-  return (
-    <div className="min-h-screen bg-background text-foreground relative overflow-hidden">
-      <div className="absolute inset-0 pointer-events-none">
-        <div className="absolute -top-40 left-1/2 h-[520px] w-[520px] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,rgba(99,102,241,0.18),transparent_65%)]" />
-        <div className="absolute -top-24 right-[-120px] h-[380px] w-[380px] rounded-full bg-[radial-gradient(circle,rgba(79,70,229,0.12),transparent_65%)]" />
-      </div>
+  const handleSeeHow = () => {
+    const target = document.getElementById("mechanism");
+    if (target) target.scrollIntoView({ behavior: "auto", block: "start" });
+  };
 
-      {/* Nav */}
+  return (
+    <div className="min-h-screen bg-background text-foreground">
       <nav className="relative z-10 flex items-center justify-between px-6 py-5 max-w-6xl mx-auto">
         <div className="text-sm font-semibold tracking-tight">Obligo</div>
-        <div className="hidden md:flex items-center gap-6 text-sm text-muted-foreground">
-          <Link href="/" className="hover:text-foreground transition-colors">
-            {NAV_LABELS.product}
-          </Link>
-          <Link href="/app/inbox" className="hover:text-foreground transition-colors">
-            {NAV_LABELS.inbox}
-          </Link>
-          <Link href="/app/obligations" className="hover:text-foreground transition-colors">
-            {NAV_LABELS.obligations}
-          </Link>
-          <Link href="/app/approvals" className="hover:text-foreground transition-colors">
-            {NAV_LABELS.approvals}
-          </Link>
-          <Link href="/app/schools" className="hover:text-foreground transition-colors">
-            {NAV_LABELS.schools}
-          </Link>
-          <Link href="/app/settings" className="hover:text-foreground transition-colors">
-            {NAV_LABELS.settings}
-          </Link>
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => router.push("/login")}
-            className="px-4 py-2 text-sm font-semibold rounded-full bg-primary text-primary-foreground hover:opacity-90"
-          >
-            Sign in
-          </button>
-          <button
-            onClick={() => router.push("/signup")}
-            className="hidden sm:inline-flex px-4 py-2 text-sm font-semibold rounded-full border border-border/60 bg-background hover:bg-muted/40"
-          >
-            Sign up
-          </button>
-        </div>
+        <Button variant="secondary" onClick={() => router.push("/login")}>
+          Sign in
+        </Button>
       </nav>
 
-      {/* Hero */}
-      <section className="relative z-10 max-w-5xl mx-auto px-6 pt-20 pb-16">
-        <div className="max-w-3xl">
+      <section className="relative z-10 max-w-5xl mx-auto px-6 pt-20 pb-12">
+        <div className="max-w-3xl space-y-6">
           <h1
-            className="mt-3 text-4xl sm:text-6xl font-semibold tracking-tight text-foreground"
+            className="text-4xl sm:text-6xl font-semibold tracking-tight text-foreground"
             style={{ fontFamily: "\"Playfair Display\", \"Georgia\", serif" }}
           >
-            Turn obligations into action.
+            Prevent silent administrative failure.
           </h1>
-          <p className="mt-5 text-lg text-muted-foreground max-w-2xl">
-            Obligo surfaces your most urgent financial aid tasks, proof gaps, and follow-ups
-            so you can act in one place.
+          <p className="text-lg text-muted-foreground max-w-2xl">
+            Obligo detects unstructured student obligations, verifies completion with proof, and
+            escalates risk before administrative requirements quietly break your semester.
           </p>
-          <div className="mt-8" />
+          <div className="flex flex-wrap gap-3">
+            <Button variant="primary" onClick={() => router.push("/signup")}
+              className="px-5 py-2.5">
+              Get started
+            </Button>
+            <Button variant="secondary" onClick={handleSeeHow} className="px-5 py-2.5">
+              See how it works
+            </Button>
+          </div>
         </div>
+      </section>
 
-        <div className="mt-12 grid grid-cols-1 md:grid-cols-3 gap-5">
-          <div className="rounded-2xl border border-border/60 bg-background p-5 shadow-sm">
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Sparkles className="w-4 h-4" /> Now
-            </div>
-            <div className="mt-3 text-sm font-semibold">Most urgent obligation</div>
-            <p className="text-xs text-muted-foreground mt-1">
-              Verification missing, due soon, and ready to resolve.
+      <section id="mechanism" className="relative z-10 max-w-5xl mx-auto px-6 py-10">
+        <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+          What Obligo does
+        </div>
+        <div className="mt-4 grid grid-cols-1 md:grid-cols-3 gap-6">
+          <div className="rounded-xl border border-border/60 bg-background p-5">
+            <h3 className="text-sm font-semibold text-foreground">Detect</h3>
+            <p className="text-xs text-muted-foreground mt-2">
+              Obligo scans emails, portals, and documents to surface obligations students do not explicitly track.
             </p>
           </div>
-          <div className="rounded-2xl border border-border/60 bg-background p-5 shadow-sm">
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Inbox className="w-4 h-4" /> {NAV_LABELS.inbox}
-            </div>
-            <div className="mt-3 text-sm font-semibold">Actionable email signals</div>
-            <p className="text-xs text-muted-foreground mt-1">
-              Extracted deadlines, schools, and proof clues—triaged for you.
+          <div className="rounded-xl border border-border/60 bg-background p-5">
+            <h3 className="text-sm font-semibold text-foreground">Verify</h3>
+            <p className="text-xs text-muted-foreground mt-2">
+              Submissions are not considered complete until confirmation or proof exists.
             </p>
           </div>
-          <div className="rounded-2xl border border-border/60 bg-background p-5 shadow-sm">
-            <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <ClipboardCheck className="w-4 h-4" /> Approvals
-            </div>
-            <div className="mt-3 text-sm font-semibold">Human‑in‑the‑loop follow‑ups</div>
-            <p className="text-xs text-muted-foreground mt-1">
-              Review draft outreach before anything is sent.
+          <div className="rounded-xl border border-border/60 bg-background p-5">
+            <h3 className="text-sm font-semibold text-foreground">Escalate</h3>
+            <p className="text-xs text-muted-foreground mt-2">
+              Blocked, time-sensitive, and unverified obligations are surfaced before consequences occur.
             </p>
           </div>
         </div>
       </section>
 
-      {/* Feature stack */}
+      <section className="relative z-10 max-w-5xl mx-auto px-6 py-10">
+        <div className="rounded-2xl border border-border/60 bg-background p-6">
+          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+            Irreversible example
+          </div>
+          <p className="mt-3 text-sm text-foreground">
+            FAFSA marked "submitted" but never verified, federal aid revoked weeks later. Obligo
+            blocks completion until confirmation exists.
+          </p>
+        </div>
+      </section>
+
+      <section className="relative z-10 max-w-5xl mx-auto px-6 py-10">
+        <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+          What Obligo is not
+        </div>
+        <ul className="mt-4 space-y-2 text-sm text-muted-foreground">
+          <li>Obligo does not complete academic work.</li>
+          <li>Obligo does not submit forms on your behalf.</li>
+          <li>Obligo does not guess - verification is required.</li>
+        </ul>
+      </section>
+
+      <section className="relative z-10 max-w-5xl mx-auto px-6 py-10">
+        <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+          Who it is for
+        </div>
+        <ul className="mt-4 space-y-2 text-sm text-muted-foreground">
+          <li>Students managing financial aid, applications, housing, and scholarships.</li>
+          <li>Transfer, international, or high-stakes students.</li>
+          <li>Anyone who has already been burned by a missed requirement.</li>
+        </ul>
+      </section>
+
       <section className="relative z-10 max-w-5xl mx-auto px-6 py-12">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-          <div className="rounded-xl border border-border/60 bg-background p-5 hover:bg-muted/30 hover:border-border transition-colors">
-            <FileCheck2 className="w-5 h-5 text-primary" />
-            <h3 className="mt-3 text-sm font-semibold">Obligations as source of truth</h3>
-            <p className="text-xs text-muted-foreground mt-1">
-              Deadlines, proofs, and statuses live in one canonical checklist.
-            </p>
+        <div className="rounded-2xl border border-border/60 bg-background p-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+          <div>
+            <div className="text-sm font-semibold text-foreground">Get started</div>
+            <div className="text-xs text-muted-foreground">No credit card. No academic work touched.</div>
           </div>
-          <div className="rounded-xl border border-border/60 bg-background p-5 hover:bg-muted/30 hover:border-border transition-colors">
-            <BellRing className="w-5 h-5 text-primary" />
-            <h3 className="mt-3 text-sm font-semibold">Risk surfaced early</h3>
-            <p className="text-xs text-muted-foreground mt-1">
-              At‑risk items stay visible until they are resolved.
-            </p>
-          </div>
-          <div className="rounded-xl border border-border/60 bg-background p-5 hover:bg-muted/30 hover:border-border transition-colors">
-            <ShieldCheck className="w-5 h-5 text-primary" />
-            <h3 className="mt-3 text-sm font-semibold">Proof-first compliance</h3>
-            <p className="text-xs text-muted-foreground mt-1">
-              Track what is verified, missing, or blocked before submission.
-            </p>
-          </div>
+          <Button variant="primary" onClick={() => router.push("/signup")} className="px-5 py-2.5">
+            Get started
+          </Button>
         </div>
       </section>
 
-      {/* Footer */}
       <footer className="border-t border-border/60 py-8 px-6">
         <div className="max-w-5xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-4 text-xs text-muted-foreground">
           <p>&copy; 2026 Obligo Inc.</p>

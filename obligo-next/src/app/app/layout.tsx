@@ -3,7 +3,7 @@
 import { ReactNode, useMemo, useState } from "react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Page } from "@/components/ui/Page";
+import { Button, Page } from "@/components/ui/Page";
 import { SelectionProvider, useSelection } from "@/components/v2/selection";
 import ObligationDrawer from "@/components/v2/ObligationDrawer";
 import { useAuth } from "@/lib/supabase/auth-provider";
@@ -36,14 +36,16 @@ function AppShellInner({ children }: { children: ReactNode }) {
           <Link href="/" className="text-sm font-semibold tracking-tight text-foreground">
             Obligo
           </Link>
-          <button
+          <Button
             onClick={() => setNavOpen((v) => !v)}
-            className="md:hidden px-3 py-2 text-xs font-semibold rounded-lg border border-gray-200 text-gray-700"
+            variant="secondary"
+            size="sm"
+            className="md:hidden"
             aria-expanded={navOpen}
             aria-controls="app-nav"
           >
             Menu
-          </button>
+          </Button>
           <nav id="app-nav" className="hidden md:flex items-center gap-2 text-xs">
             {NAV_ITEMS.map((item) => {
               const active = activeHref === item.href;
