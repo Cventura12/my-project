@@ -23,15 +23,7 @@ export default function LandingPage() {
 
       {/* Nav */}
       <nav className="relative z-10 flex items-center justify-between px-6 py-5 max-w-6xl mx-auto">
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl border border-border/60 bg-background flex items-center justify-center font-bold">
-            O
-          </div>
-          <div className="leading-tight">
-            <div className="text-[11px] uppercase tracking-widest text-muted-foreground">Obligo</div>
-            <div className="text-sm font-semibold">Command Center</div>
-          </div>
-        </div>
+        <div className="text-sm font-semibold tracking-tight">Obligo</div>
         <div className="hidden md:flex items-center gap-6 text-sm text-muted-foreground">
           <span>Product</span>
           <span>Inbox</span>
@@ -59,7 +51,7 @@ export default function LandingPage() {
       <section className="relative z-10 max-w-5xl mx-auto px-6 pt-20 pb-16">
         <div className="max-w-3xl">
           <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-            Obligo Command Center
+            Obligo
           </p>
           <h1
             className="mt-3 text-4xl sm:text-6xl font-semibold tracking-tight text-foreground"
