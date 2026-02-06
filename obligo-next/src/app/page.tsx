@@ -1,6 +1,7 @@
 "use client";
 
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import {
   ArrowRight,
   Inbox,
@@ -25,11 +26,21 @@ export default function LandingPage() {
       <nav className="relative z-10 flex items-center justify-between px-6 py-5 max-w-6xl mx-auto">
         <div className="text-sm font-semibold tracking-tight">Obligo</div>
         <div className="hidden md:flex items-center gap-6 text-sm text-muted-foreground">
-          <span>Product</span>
-          <span>Inbox</span>
-          <span>Obligations</span>
-          <span>Approvals</span>
-          <span>Schools</span>
+          <Link href="/" className="hover:text-foreground transition-colors">
+            Product
+          </Link>
+          <Link href="/app/inbox" className="hover:text-foreground transition-colors">
+            Inbox
+          </Link>
+          <Link href="/app/obligations" className="hover:text-foreground transition-colors">
+            Obligations
+          </Link>
+          <Link href="/app/approvals" className="hover:text-foreground transition-colors">
+            Approvals
+          </Link>
+          <Link href="/app/schools" className="hover:text-foreground transition-colors">
+            Schools
+          </Link>
         </div>
         <div className="flex items-center gap-2">
           <button
