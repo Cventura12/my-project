@@ -1058,6 +1058,7 @@ async def gmail_oauth_callback(code: str = None, error: str = None, state: Optio
             upsert_payload = {
                 "user_id": user_id,
                 "provider": "gmail",
+                "email": tokens.get("email") or existing_data.get("email_address"),
                 "access_token": tokens["access_token"],
                 # Google may not return refresh_token on subsequent consents.
                 "refresh_token": tokens.get("refresh_token") or existing_data.get("refresh_token"),
