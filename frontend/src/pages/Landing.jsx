@@ -120,7 +120,7 @@ export const Landing = () => {
             <div className="w-10 h-10 rounded-xl bg-slate-900 flex items-center justify-center">
               <span className="text-white font-bold text-lg">O</span>
             </div>
-            <span className="text-xl font-bold text-slate-900">Obligo</span>
+            <span className="text-xl font-bold text-slate-900">OBLIGO</span>
           </div>
           <a
             href="#features"

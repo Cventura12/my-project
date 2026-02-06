@@ -17,7 +17,7 @@ export const AppLayout = ({ children }) => {
           <div className="w-8 h-8 rounded-lg bg-slate-900 flex items-center justify-center">
             <span className="text-white font-bold text-sm">O</span>
           </div>
-          <span className="text-lg font-semibold text-slate-900">Obligo</span>
+          <span className="text-lg font-semibold text-slate-900">OBLIGO</span>
         </div>
         <button
           onClick={handleLogout}
