@@ -6,6 +6,7 @@ import { useAuth } from "@/lib/supabase/auth-provider";
 import { useEmails, AnalyzedEmail } from "@/lib/hooks/useEmails";
 import EmailCard from "@/components/financial-aid/EmailCard";
 import CriticalOblBar from "@/components/financial-aid/CriticalOblBar";
+import LegacyBanner from "@/components/financial-aid/LegacyBanner";
 import {
   ArrowLeft,
   Mail,
@@ -133,6 +134,8 @@ export default function EmailsPage() {
           </div>
         </div>
       </header>
+
+      <LegacyBanner />
 
       {/* Phase 3 Step 2: Cross-context visibility.
           Critical/failed obligations are visible on EVERY main screen. */}

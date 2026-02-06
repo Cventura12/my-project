@@ -6,6 +6,7 @@ import { useAuth } from "@/lib/supabase/auth-provider";
 import { useFollowUps, FollowUp } from "@/lib/hooks/useFollowUps";
 import EmailDraftModal from "@/components/financial-aid/EmailDraftModal";
 import CriticalOblBar from "@/components/financial-aid/CriticalOblBar";
+import LegacyBanner from "@/components/financial-aid/LegacyBanner";
 import {
   ArrowLeft,
   FileEdit,
@@ -79,6 +80,8 @@ export default function ApprovalsPage() {
           </div>
         </div>
       </header>
+
+      <LegacyBanner />
 
       {/* Phase 3 Step 2: Cross-context visibility. */}
       <CriticalOblBar />

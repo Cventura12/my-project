@@ -13,5 +13,6 @@ export async function GET(request: Request) {
     await supabase.auth.exchangeCodeForSession(code);
   }
 
-  return NextResponse.redirect(new URL("/financial-aid", requestUrl.origin));
+  return NextResponse.redirect(new URL("/app/today", requestUrl.origin));
 }
+

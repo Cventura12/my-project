@@ -273,7 +273,7 @@ export default function OnboardingPage() {
         }
       }
 
-      router.push("/dashboard");
+      router.push("/app/today");
     } catch (e: any) {
       console.error("Onboarding finish error:", e);
       setError(e?.message || "Something went wrong. Please try again.");
@@ -766,3 +766,4 @@ export default function OnboardingPage() {
     </div>
   );
 }
+

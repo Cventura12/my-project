@@ -23,7 +23,7 @@ export default function LoginPage() {
       setError(error.message);
       setLoading(false);
     } else {
-      router.push("/financial-aid");
+      router.push("/app/today");
     }
   };
 
@@ -99,3 +99,4 @@ export default function LoginPage() {
     </div>
   );
 }
+

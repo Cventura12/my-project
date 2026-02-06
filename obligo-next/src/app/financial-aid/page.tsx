@@ -9,6 +9,7 @@ import { useObligations, ObligationRow, ObligationBlocker, OverriddenDep, StuckI
 import { useFollowUps } from "@/lib/hooks/useFollowUps";
 import { createSupabaseBrowser } from "@/lib/supabase/client";
 import SchoolCard from "@/components/financial-aid/SchoolCard";
+import LegacyBanner from "@/components/financial-aid/LegacyBanner";
 import {
   Plus, LogOut, FileText, AlertTriangle, CheckCircle2,
   Mail, FileEdit, MessageSquareWarning, Loader2, ShieldAlert, XOctagon, Ban, Lock, AlertCircle, Pause,
@@ -1111,6 +1112,8 @@ export default function FinancialAidDashboard() {
           </div>
         </div>
       </header>
+
+      <LegacyBanner />
 
       <main className="max-w-3xl mx-auto px-4 sm:px-6 py-8">
         <input type="file" ref={proofInputRef} onChange={handleProofFileSelected} className="hidden" />

@@ -9,6 +9,7 @@ import DocumentChecklist from "@/components/financial-aid/DocumentChecklist";
 import DocumentStatusModal from "@/components/financial-aid/DocumentStatusModal";
 import AddDocumentForm from "@/components/financial-aid/AddDocumentForm";
 import CriticalOblBar from "@/components/financial-aid/CriticalOblBar";
+import LegacyBanner from "@/components/financial-aid/LegacyBanner";
 import { ArrowLeft, Trash2, FileText, CheckCircle2, Clock, AlertTriangle } from "lucide-react";
 
 // Phase 2 Step 2 BYPASS AUDIT:
@@ -90,6 +91,8 @@ export default function SchoolDetailPage() {
           </div>
         </div>
       </header>
+
+      <LegacyBanner />
 
       {/* Phase 3 Step 2: Cross-context visibility. */}
       <CriticalOblBar />
