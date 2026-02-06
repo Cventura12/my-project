@@ -7,7 +7,7 @@ interface DrawerProps {
   isOpen: boolean;
   onClose: () => void;
   title?: string;
-  children: React.ReactNode;
+  children?: React.ReactNode;
 }
 
 const ANIM_MS = 220;
