@@ -47,10 +47,10 @@ export default function LandingPage() {
             Sign in
           </button>
           <button
-            onClick={() => router.push("/app/today")}
+            onClick={() => router.push("/signup")}
             className="hidden sm:inline-flex px-4 py-2 text-sm font-semibold rounded-full border border-border/60 bg-background hover:bg-muted/40"
           >
-            Open app
+            Sign up
           </button>
         </div>
       </nav>
@@ -71,20 +71,7 @@ export default function LandingPage() {
             Obligo surfaces your most urgent financial aid tasks, proof gaps, and follow-ups
             so you can act in one place.
           </p>
-          <div className="mt-8 flex flex-wrap items-center gap-3">
-            <button
-              onClick={() => router.push("/login")}
-              className="px-6 py-3 text-sm font-semibold rounded-full bg-primary text-primary-foreground hover:opacity-90"
-            >
-              Sign in to your workspace
-            </button>
-            <button
-              onClick={() => router.push("/app/today")}
-              className="px-6 py-3 text-sm font-semibold rounded-full border border-border/60 bg-background hover:bg-muted/40"
-            >
-              View the command center
-            </button>
-          </div>
+          <div className="mt-8" />
         </div>
 
         <div className="mt-12 grid grid-cols-1 md:grid-cols-3 gap-5">
