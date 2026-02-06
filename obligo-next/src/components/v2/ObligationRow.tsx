@@ -35,13 +35,13 @@ export default function ObligationRow({ item }: { item: UIObligationSummary }) {
           <p className="text-xs text-muted-foreground mt-1 truncate">{item.schoolName}</p>
         </div>
         <div className="text-right text-xs">
-          <div className="text-black font-medium">{due.primary}</div>
+          <div className="text-foreground font-medium">{due.primary}</div>
           {due.secondary && <div className="text-muted-foreground">{due.secondary}</div>}
         </div>
       </div>
 
       <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
-        <span className="px-2 py-0.5 rounded-full border bg-amber-50 text-amber-700 border-amber-200">
+        <span className="px-2 py-0.5 rounded-full border bg-amber-500/10 text-amber-800 border-amber-500/20">
           {primaryTruth(item)}
         </span>
         <span className="text-muted-foreground truncate">{item.reasonLine}</span>

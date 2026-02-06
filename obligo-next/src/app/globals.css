@@ -14,7 +14,7 @@
     --foreground: 221 39% 11%;     /* #111827 - Bold black */
     --card: 0 0% 100%;             /* #FFFFFF - Pure white */
     --card-foreground: 221 39% 11%;
-    --primary: 160 84% 39%;        /* #10B981 - Bright green */
+    --primary: 243 75% 59%;        /* #4F46E5 - Indigo */
     --primary-foreground: 0 0% 100%;
     --muted: 220 13% 91%;
     --muted-foreground: 220 9% 46%;
@@ -27,7 +27,7 @@
   }
 
   body {
-    @apply bg-[#F0FDF4] text-gray-900 antialiased;
+    @apply bg-background text-foreground antialiased;
     font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   }
 

@@ -20,18 +20,31 @@ export default function TodayHeader({ items }: { items: UIObligationSummary[] })
         <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
           Command Center
         </p>
-        <h1 className="text-3xl font-semibold tracking-tight text-black">Today</h1>
+        <h1 className="text-3xl font-semibold tracking-tight text-foreground">Today</h1>
       </div>
       <div className="flex flex-wrap items-center gap-2 text-xs">
-        <span className="px-2 py-1 rounded-full border bg-red-50 text-red-700 border-red-200">
+        <span className="px-2 py-1 rounded-full border bg-destructive/10 text-destructive border-destructive/20">
           {counts.critical} Critical
         </span>
-        <span className="px-2 py-1 rounded-full border bg-orange-50 text-orange-700 border-orange-200">
+        <span className="px-2 py-1 rounded-full border bg-amber-500/10 text-amber-700 border-amber-500/20">
           {counts.high} High
         </span>
-        <span className="px-2 py-1 rounded-full border bg-gray-50 text-gray-700 border-gray-200">
+        <span className="px-2 py-1 rounded-full border bg-muted text-muted-foreground border-border/60">
           {counts.normal} Normal
         </span>
+        <div className="ml-auto flex items-center gap-2">
+          <input
+            type="text"
+            placeholder="Search (coming soon)"
+            className="px-3 py-1.5 text-xs bg-muted/30 border border-border/60 rounded-lg text-muted-foreground opacity-80 cursor-not-allowed"
+            disabled
+            aria-disabled="true"
+            tabIndex={-1}
+          />
+          <span className="px-2 py-1 rounded-full border bg-muted text-muted-foreground border-border/60">
+            Coming soon
+          </span>
+        </div>
       </div>
     </div>
   );

@@ -27,7 +27,7 @@ export default function NowCard({ item }: { item: UIObligationSummary }) {
   const cta = chip.toLowerCase().includes("proof") ? "Upload proof" : "Open";
 
   return (
-    <div className="rounded-2xl border border-border/60 bg-background p-5 shadow-sm">
+    <div className="rounded-2xl border border-border/60 bg-background p-5 shadow-sm hover:bg-muted/30 hover:border-border transition-colors">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
           <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
@@ -37,13 +37,13 @@ export default function NowCard({ item }: { item: UIObligationSummary }) {
           <p className="text-sm text-muted-foreground mt-1 truncate">{item.schoolName}</p>
         </div>
         <div className="text-right text-sm">
-          <div className="text-black font-medium">{due.primary}</div>
+          <div className="text-foreground font-medium">{due.primary}</div>
           {due.secondary && <div className="text-xs text-muted-foreground">{due.secondary}</div>}
         </div>
       </div>
 
       <div className="mt-4 flex flex-wrap items-center gap-2 text-xs">
-        <span className="px-2 py-1 rounded-full border bg-amber-50 text-amber-700 border-amber-200">
+        <span className="px-2 py-1 rounded-full border bg-amber-500/10 text-amber-800 border-amber-500/20">
           {chip}
         </span>
         <p className="text-muted-foreground">{item.reasonLine}</p>
@@ -52,7 +52,7 @@ export default function NowCard({ item }: { item: UIObligationSummary }) {
       <div className="mt-4">
         <button
           onClick={() => openDrawer(item.id)}
-          className="px-4 py-2 text-sm font-semibold rounded-lg bg-black text-white hover:bg-gray-800"
+          className="px-4 py-2 text-sm font-semibold rounded-lg bg-primary text-primary-foreground hover:opacity-90"
         >
           {cta}
         </button>

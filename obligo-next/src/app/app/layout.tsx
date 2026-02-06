@@ -29,8 +29,8 @@ function AppShellInner({ children }: { children: ReactNode }) {
   }, [pathname]);
 
   return (
-    <div className="min-h-screen bg-[#F0FDF4]">
-      <header className="bg-white border-b-2 border-black">
+    <div className="min-h-screen bg-background">
+      <header className="bg-background border-b border-border/60">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className="w-9 h-9 rounded-lg border border-gray-200 flex items-center justify-center font-black text-xs">
@@ -58,8 +58,8 @@ function AppShellInner({ children }: { children: ReactNode }) {
                   href={item.href}
                   className={`px-3 py-1.5 rounded-full border transition-colors ${
                     active
-                      ? "bg-black text-white border-black"
-                      : "bg-white text-gray-600 border-gray-200 hover:border-black hover:text-black"
+                      ? "bg-primary text-primary-foreground border-primary"
+                      : "bg-background text-foreground border border-border/60 hover:bg-muted/40"
                   }`}
                 >
                   {item.label}
@@ -68,7 +68,7 @@ function AppShellInner({ children }: { children: ReactNode }) {
             })}
           </nav>
         </div>
-        <div className={`md:hidden border-t border-gray-100 ${navOpen ? "block" : "hidden"}`}>
+        <div className={`md:hidden border-t border-border/60 ${navOpen ? "block" : "hidden"}`}>
           <div className="max-w-6xl mx-auto px-4 sm:px-6 py-3 flex flex-wrap gap-2">
             {NAV_ITEMS.map((item) => {
               const active = activeHref === item.href;
@@ -79,8 +79,8 @@ function AppShellInner({ children }: { children: ReactNode }) {
                   onClick={() => setNavOpen(false)}
                   className={`px-3 py-1.5 rounded-full border text-xs transition-colors ${
                     active
-                      ? "bg-black text-white border-black"
-                      : "bg-white text-gray-600 border-gray-200 hover:border-black hover:text-black"
+                      ? "bg-primary text-primary-foreground border-primary"
+                      : "bg-background text-foreground border border-border/60 hover:bg-muted/40"
                   }`}
                 >
                   {item.label}
