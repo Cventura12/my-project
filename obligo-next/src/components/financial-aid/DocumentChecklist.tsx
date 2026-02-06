@@ -1,6 +1,7 @@
 "use client";
 
 import { Document } from "@/lib/hooks/useDocuments";
+import { STATUS_LABELS } from "@/lib/copy";
 import { CheckCircle2, Clock, AlertCircle, Circle, FileWarning, ShieldCheck } from "lucide-react";
 
 interface Props {
@@ -12,9 +13,9 @@ interface Props {
 const statusConfig: Record<Document["status"], { icon: any; color: string; bg: string; label: string }> = {
   not_started: { icon: Circle, color: "text-gray-400", bg: "bg-gray-50", label: "Not Started" },
   in_progress: { icon: Clock, color: "text-yellow-600", bg: "bg-yellow-50", label: "In Progress" },
-  submitted: { icon: CheckCircle2, color: "text-blue-600", bg: "bg-blue-50", label: "Submitted" },
+  submitted: { icon: CheckCircle2, color: "text-blue-600", bg: "bg-blue-50", label: STATUS_LABELS.submitted },
   received: { icon: CheckCircle2, color: "text-emerald-600", bg: "bg-emerald-50", label: "Received" },
-  verified: { icon: ShieldCheck, color: "text-emerald-700", bg: "bg-emerald-50", label: "Verified" },
+  verified: { icon: ShieldCheck, color: "text-emerald-700", bg: "bg-emerald-50", label: STATUS_LABELS.verified },
   issue: { icon: FileWarning, color: "text-red-600", bg: "bg-red-50", label: "Issue" },
 };
 

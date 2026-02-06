@@ -2,6 +2,7 @@
 
 import { UIObligationSummary } from "@/types/ui";
 import { useSelection } from "./selection";
+import { BUTTON_LABELS, STATUS_LABELS } from "@/lib/copy";
 
 function formatDue(deadline: Date | null) {
   if (!deadline) return { primary: "No deadline", secondary: "" };
@@ -14,8 +15,13 @@ function formatDue(deadline: Date | null) {
 }
 
 function primaryChip(item: UIObligationSummary) {
-  if (item.proofRequired && item.proofCount === 0) return "Proof missing";
-  if (item.isBlocked) return "Blocked";
+  if (item.proofRequired && item.proofCount === 0) return STATUS_LABELS.proofMissing;
+  if (item.isBlocked) return STATUS_LABELS.blocked;
+  if (item.status === "pending") return STATUS_LABELS.pending;
+  if (item.status === "submitted") return STATUS_LABELS.submitted;
+  if (item.status === "verified") return STATUS_LABELS.verified;
+  if (item.status === "failed") return STATUS_LABELS.failed;
+  if (item.status === "blocked") return STATUS_LABELS.blocked;
   if (item.status) return item.status.replaceAll("_", " ");
   return "Needs attention";
 }
@@ -24,7 +30,9 @@ export default function NowCard({ item }: { item: UIObligationSummary }) {
   const { openDrawer } = useSelection();
   const due = formatDue(item.deadline);
   const chip = primaryChip(item);
-  const cta = chip.toLowerCase().includes("proof") ? "Upload proof" : "Open";
+  const cta = chip.toLowerCase().includes("verification")
+    ? BUTTON_LABELS.uploadProof
+    : BUTTON_LABELS.reviewObligation;
 
   return (
     <div className="rounded-2xl border border-border/60 bg-background p-5 shadow-sm hover:bg-muted/30 hover:border-border transition-colors">

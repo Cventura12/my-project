@@ -1,6 +1,7 @@
 "use client";
 
 import { UIObligationSummary } from "@/types/ui";
+import { STATUS_LABELS } from "@/lib/copy";
 
 function formatBlockedBy(blockedBy?: Array<{ type: string; title: string; status: string }>) {
   if (!blockedBy || blockedBy.length === 0) return "";
@@ -21,11 +22,11 @@ export function toUIObligationSummary(input: {
   const isBlocked = obl.status === "blocked" || !!blockedBySummary;
 
   let reasonLine = "No deadline";
-  if (obl.status === "verified") reasonLine = "Verified";
-  else if (obl.status === "failed") reasonLine = "Deadline passed without verification";
+  if (obl.status === "verified") reasonLine = STATUS_LABELS.verified;
+  else if (obl.status === "failed") reasonLine = STATUS_LABELS.failed;
   else if (isBlocked) reasonLine = `Blocked by ${blockedBySummary || "dependency"}`;
   else if (obl.proof_required && proofCount === 0 && obl.status === "submitted") {
-    reasonLine = "Submitted but missing proof";
+    reasonLine = STATUS_LABELS.proofMissing;
   } else if (obl.deadline) {
     reasonLine = `Due ${new Date(obl.deadline).toLocaleDateString()}`;
   }

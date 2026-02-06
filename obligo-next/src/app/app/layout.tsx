@@ -7,14 +7,15 @@ import { Page } from "@/components/ui/Page";
 import { SelectionProvider, useSelection } from "@/components/v2/selection";
 import ObligationDrawer from "@/components/v2/ObligationDrawer";
 import { useAuth } from "@/lib/supabase/auth-provider";
+import { NAV_LABELS } from "@/lib/copy";
 
 const NAV_ITEMS = [
-  { label: "Today", href: "/app/today" },
-  { label: "Inbox", href: "/app/inbox" },
-  { label: "Obligations", href: "/app/obligations" },
-  { label: "Approvals", href: "/app/approvals" },
-  { label: "Schools", href: "/app/schools" },
-  { label: "Settings", href: "/app/settings" },
+  { label: NAV_LABELS.today, href: "/app/today" },
+  { label: NAV_LABELS.inbox, href: "/app/inbox" },
+  { label: NAV_LABELS.obligations, href: "/app/obligations" },
+  { label: NAV_LABELS.approvals, href: "/app/approvals" },
+  { label: NAV_LABELS.schools, href: "/app/schools" },
+  { label: NAV_LABELS.settings, href: "/app/settings" },
 ] as const;
 
 function AppShellInner({ children }: { children: ReactNode }) {

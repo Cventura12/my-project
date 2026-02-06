@@ -11,6 +11,7 @@ import AddDocumentForm from "@/components/financial-aid/AddDocumentForm";
 import CriticalOblBar from "@/components/financial-aid/CriticalOblBar";
 import LegacyBanner from "@/components/financial-aid/LegacyBanner";
 import { ArrowLeft, Trash2, FileText, CheckCircle2, Clock, AlertTriangle } from "lucide-react";
+import { STATUS_LABELS } from "@/lib/copy";
 
 // Phase 2 Step 2 BYPASS AUDIT:
 // This page manages DOCUMENTS (paperwork tracking), not OBLIGATIONS (completion tracking).
@@ -130,7 +131,7 @@ export default function SchoolDetailPage() {
                 <Clock className="w-4 h-4 text-yellow-500" />
                 <div>
                   <p className="text-sm font-bold text-yellow-600">{pending}</p>
-                  <p className="text-[10px] text-gray-400">Pending</p>
+                  <p className="text-[10px] text-gray-400">{STATUS_LABELS.pending}</p>
                 </div>
               </div>
               <div className="flex items-center gap-2">

@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/supabase/auth-provider";
 import { useEmails, AnalyzedEmail } from "@/lib/hooks/useEmails";
 import { createSupabaseBrowser } from "@/lib/supabase/client";
+import { NAV_LABELS, EMPTY_STATES, BUTTON_LABELS } from "@/lib/copy";
 import {
   Inbox,
   Mail,
@@ -181,7 +182,7 @@ export default function InboxPage() {
               <Inbox className="w-4 h-4" />
             </div>
             <div>
-              <h1 className="text-lg font-bold text-black">Signals Inbox</h1>
+              <h1 className="text-lg font-bold text-black">{NAV_LABELS.inbox}</h1>
               <p className="text-xs text-gray-400">Signals only. Canonical work lives in Obligations.</p>
             </div>
           </div>
@@ -255,7 +256,7 @@ export default function InboxPage() {
             {!hasSignals && connection.connected && (
               <div className="bg-white border-2 border-dashed border-gray-300 rounded-xl p-12 text-center">
                 <Inbox className="w-8 h-8 text-gray-300 mx-auto mb-3" />
-                <p className="text-gray-700 text-sm font-medium">No actionable signals yet</p>
+                <p className="text-gray-700 text-sm font-medium whitespace-pre-line">{EMPTY_STATES.inbox}</p>
                 <p className="text-gray-400 text-xs mt-1">
                   Click “Scan emails” to check for new signals.
                 </p>
@@ -320,7 +321,7 @@ export default function InboxPage() {
                         className="inline-flex items-center gap-2 px-3 py-2 text-xs font-semibold rounded-lg border border-gray-300 text-gray-600 hover:bg-gray-50 transition-colors"
                       >
                         <X className="w-3.5 h-3.5" />
-                        Dismiss
+                        {BUTTON_LABELS.dismiss}
                       </button>
                     </div>
                   </div>

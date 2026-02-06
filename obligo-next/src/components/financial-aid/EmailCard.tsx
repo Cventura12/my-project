@@ -1,6 +1,7 @@
 "use client";
 
 import { AnalyzedEmail } from "@/lib/hooks/useEmails";
+import { BUTTON_LABELS } from "@/lib/copy";
 import {
   Mail,
   AlertTriangle,
@@ -112,7 +113,7 @@ export default function EmailCard({ email, onDismiss, onAttachConfirmationProof 
                   className="px-2 py-0.5 text-[10px] font-semibold uppercase rounded-full bg-amber-50 text-amber-700 border border-amber-200 hover:border-amber-300 transition-colors"
                   title="Attach as confirmation_email proof (does not auto-verify)"
                 >
-                  Attach proof
+                  {BUTTON_LABELS.uploadProof}
                 </button>
               )}
             </div>
@@ -143,7 +144,7 @@ export default function EmailCard({ email, onDismiss, onAttachConfirmationProof 
           <button
             onClick={() => onDismiss(email.id)}
             className="w-7 h-7 rounded-lg border border-gray-200 flex items-center justify-center hover:bg-red-50 hover:border-red-200 transition-colors"
-            title="Dismiss"
+            title={BUTTON_LABELS.dismiss}
           >
             <X className="w-3.5 h-3.5 text-gray-400" />
           </button>

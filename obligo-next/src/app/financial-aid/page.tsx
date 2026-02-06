@@ -28,6 +28,7 @@ import {
   SEVERITY_STYLES,
   type SeverityLevel,
 } from "@/lib/severity";
+import { BUTTON_LABELS, STATUS_LABELS } from "@/lib/copy";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -332,9 +333,9 @@ export default function FinancialAidDashboard() {
       const blockerList = blockers.map((b) => {
         const action =
           b.status === "pending" || b.status === "blocked"
-            ? "Submit and verify"
+            ? "Mark submitted & confirm verification"
             : b.status === "submitted"
-            ? "Verify"
+            ? "Confirm verification"
             : "Complete";
         return `  - ${b.type} ("${b.title}") → ${action} this first`;
       }).join("\n");
@@ -896,9 +897,9 @@ export default function FinancialAidDashboard() {
               {blockers.map((b) => {
                 const action =
                   b.status === "pending" || b.status === "blocked"
-                    ? `Submit and verify "${b.title}"`
+                    ? `Mark submitted & confirm verification "${b.title}"`
                     : b.status === "submitted"
-                    ? `Verify "${b.title}"`
+                    ? `Confirm verification "${b.title}"`
                     : `Complete "${b.title}"`;
                 return (
                   <div key={b.obligation_id} className="ml-5 mb-1.5 last:mb-0">
@@ -1031,7 +1032,7 @@ export default function FinancialAidDashboard() {
                 disabled={busyObligationId === obl.id}
                 className="px-2.5 py-1 text-[10px] font-semibold rounded-lg bg-black text-white hover:bg-gray-800 disabled:opacity-50 transition-colors"
               >
-                Submitted
+                {BUTTON_LABELS.submit}
               </button>
             )}
             {obl.status === "submitted" && !verifyBlocked && !depBlocked && (
@@ -1039,9 +1040,9 @@ export default function FinancialAidDashboard() {
                 onClick={() => setObligationStatus(obl.id, "verified", obl.proof_required)}
                 disabled={busyObligationId === obl.id}
                 className="px-2.5 py-1 text-[10px] font-semibold rounded-lg bg-emerald-600 text-white hover:bg-emerald-700 disabled:opacity-50 transition-colors"
-                title={obl.proof_required ? "Blocked without proof" : "Mark verified"}
+                title={obl.proof_required ? "Blocked without proof" : BUTTON_LABELS.verify}
               >
-                Verify
+                {BUTTON_LABELS.verify}
               </button>
             )}
             {proofMissingIds.has(obl.id) && (
@@ -1172,7 +1173,7 @@ export default function FinancialAidDashboard() {
             <div className="bg-white border-2 border-black rounded-xl p-4 text-center">
               <CheckCircle2 className="w-5 h-5 text-emerald-500 mx-auto" />
               <p className="text-2xl font-bold text-emerald-600 mt-1">{submitted}</p>
-              <p className="text-[10px] text-gray-400 font-medium uppercase">Submitted</p>
+              <p className="text-[10px] text-gray-400 font-medium uppercase">{STATUS_LABELS.submitted}</p>
             </div>
             <div className={`bg-white border-2 rounded-xl p-4 text-center ${
               criticalCount > 0 ? "border-red-400"
@@ -1194,12 +1195,12 @@ export default function FinancialAidDashboard() {
               }`}>
                 {criticalCount + highCount + elevatedCount}
               </p>
-              <p className="text-[10px] text-gray-400 font-medium uppercase">At Risk</p>
+              <p className="text-[10px] text-gray-400 font-medium uppercase">{STATUS_LABELS.atRisk}</p>
             </div>
             <div className={`border-2 rounded-xl p-4 text-center ${failedCount > 0 ? "bg-red-100 border-red-600" : "bg-white border-black"}`}>
               <XOctagon className={`w-5 h-5 mx-auto ${failedCount > 0 ? "text-red-700" : "text-gray-400"}`} />
               <p className={`text-2xl font-black mt-1 ${failedCount > 0 ? "text-red-800" : "text-gray-600"}`}>{failedCount}</p>
-              <p className={`text-[10px] font-medium uppercase ${failedCount > 0 ? "text-red-700 font-bold" : "text-gray-400"}`}>Failed</p>
+              <p className={`text-[10px] font-medium uppercase ${failedCount > 0 ? "text-red-700 font-bold" : "text-gray-400"}`}>{STATUS_LABELS.failed}</p>
             </div>
           </div>
         )}

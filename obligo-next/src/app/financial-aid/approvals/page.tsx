@@ -6,6 +6,7 @@ import { useAuth } from "@/lib/supabase/auth-provider";
 import { useFollowUps, FollowUp } from "@/lib/hooks/useFollowUps";
 import EmailDraftModal from "@/components/financial-aid/EmailDraftModal";
 import CriticalOblBar from "@/components/financial-aid/CriticalOblBar";
+import { STATUS_LABELS, EMPTY_STATES } from "@/lib/copy";
 import LegacyBanner from "@/components/financial-aid/LegacyBanner";
 import {
   ArrowLeft,
@@ -17,7 +18,7 @@ import {
 } from "lucide-react";
 
 const statusConfig: Record<string, { icon: any; color: string; bg: string; label: string }> = {
-  pending_approval: { icon: Clock, color: "text-yellow-600", bg: "bg-yellow-50", label: "Pending" },
+  pending_approval: { icon: Clock, color: "text-yellow-600", bg: "bg-yellow-50", label: STATUS_LABELS.pending },
   sent: { icon: CheckCircle2, color: "text-emerald-600", bg: "bg-emerald-50", label: "Sent" },
   cancelled: { icon: Ban, color: "text-gray-400", bg: "bg-gray-50", label: "Cancelled" },
 };
@@ -95,7 +96,7 @@ export default function ApprovalsPage() {
               filter === "pending" ? "bg-black text-white" : "bg-gray-100 text-gray-500 hover:bg-gray-200"
             }`}
           >
-            Pending ({pendingDrafts.length})
+            {STATUS_LABELS.pending} ({pendingDrafts.length})
           </button>
           <button
             onClick={() => setFilter("sent")}
@@ -119,16 +120,7 @@ export default function ApprovalsPage() {
         {filtered.length === 0 ? (
           <div className="bg-white border-2 border-dashed border-gray-300 rounded-xl p-12 text-center">
             <FileEdit className="w-8 h-8 text-gray-300 mx-auto mb-3" />
-            <p className="text-gray-500 text-sm">
-              {filter === "pending"
-                ? "No drafts pending approval."
-                : filter === "sent"
-                ? "No emails sent yet."
-                : "No drafts created yet."}
-            </p>
-            <p className="text-gray-400 text-xs mt-1">
-              Open a document and click &quot;Draft Follow-up&quot; to get started.
-            </p>
+            <p className="text-gray-500 text-sm whitespace-pre-line">{EMPTY_STATES.approvals}</p>
           </div>
         ) : (
           <div className="space-y-3">

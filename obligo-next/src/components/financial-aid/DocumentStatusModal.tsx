@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { Document } from "@/lib/hooks/useDocuments";
+import { STATUS_LABELS } from "@/lib/copy";
 import { X, Mail, Loader2 } from "lucide-react";
 
 interface Props {
@@ -16,7 +17,7 @@ interface Props {
 const statuses: { value: Document["status"]; label: string }[] = [
   { value: "not_started", label: "Not Started" },
   { value: "in_progress", label: "In Progress" },
-  { value: "submitted", label: "Submitted" },
+  { value: "submitted", label: STATUS_LABELS.submitted },
   // Phase 1 Step 3 (Credibility): "received"/"verified" are optimistic and are BLOCKED.
   // Proof must be attached to the linked canonical `obligations` row before verification.
   //
@@ -31,7 +32,7 @@ const statuses: { value: Document["status"]; label: string }[] = [
   // prerequisites are verified. This is intentional — documents track paperwork status,
   // obligations track completion status. They are linked but not coupled.
   { value: "received", label: "Received" },
-  { value: "verified", label: "Verified" },
+  { value: "verified", label: STATUS_LABELS.verified },
   { value: "issue", label: "Issue" },
 ];
 

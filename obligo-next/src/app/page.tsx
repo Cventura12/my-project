@@ -2,6 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { NAV_LABELS } from "@/lib/copy";
 import {
   ArrowRight,
   Inbox,
@@ -27,22 +28,22 @@ export default function LandingPage() {
         <div className="text-sm font-semibold tracking-tight">Obligo</div>
         <div className="hidden md:flex items-center gap-6 text-sm text-muted-foreground">
           <Link href="/" className="hover:text-foreground transition-colors">
-            Product
+            {NAV_LABELS.product}
           </Link>
           <Link href="/app/inbox" className="hover:text-foreground transition-colors">
-            Inbox
+            {NAV_LABELS.inbox}
           </Link>
           <Link href="/app/obligations" className="hover:text-foreground transition-colors">
-            Obligations
+            {NAV_LABELS.obligations}
           </Link>
           <Link href="/app/approvals" className="hover:text-foreground transition-colors">
-            Approvals
+            {NAV_LABELS.approvals}
           </Link>
           <Link href="/app/schools" className="hover:text-foreground transition-colors">
-            Schools
+            {NAV_LABELS.schools}
           </Link>
           <Link href="/app/settings" className="hover:text-foreground transition-colors">
-            Settings
+            {NAV_LABELS.settings}
           </Link>
         </div>
         <div className="flex items-center gap-2">
@@ -84,12 +85,12 @@ export default function LandingPage() {
             </div>
             <div className="mt-3 text-sm font-semibold">Most urgent obligation</div>
             <p className="text-xs text-muted-foreground mt-1">
-              Proof missing, due soon, and ready to resolve.
+              Verification missing, due soon, and ready to resolve.
             </p>
           </div>
           <div className="rounded-2xl border border-border/60 bg-background p-5 shadow-sm">
             <div className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Inbox className="w-4 h-4" /> Signals Inbox
+              <Inbox className="w-4 h-4" /> {NAV_LABELS.inbox}
             </div>
             <div className="mt-3 text-sm font-semibold">Actionable email signals</div>
             <p className="text-xs text-muted-foreground mt-1">

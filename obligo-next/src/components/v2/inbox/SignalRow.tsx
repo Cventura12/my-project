@@ -1,6 +1,7 @@
 "use client";
 
 import { UISignal } from "@/types/ui";
+import { BUTTON_LABELS } from "@/lib/copy";
 
 function relativeTime(iso?: string) {
   if (!iso) return "";
@@ -81,13 +82,13 @@ export default function SignalRow({
           onClick={onOpen}
           className="px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:text-black hover:border-gray-400"
         >
-          Open
+          {BUTTON_LABELS.open}
         </button>
         <button
           onClick={onDismiss}
           className="px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:text-black hover:border-gray-400"
         >
-          Dismiss
+          {BUTTON_LABELS.dismiss}
         </button>
       </div>
     </div>

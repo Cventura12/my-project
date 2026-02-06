@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { Check, ChevronDown, Zap, AlertCircle, ExternalLink, HelpCircle } from "lucide-react";
 import { TaskCardProps, Priority } from "@/lib/types";
+import { BUTTON_LABELS } from "@/lib/copy";
 
 /**
  * TaskCard Component - Mint & Black Theme
@@ -147,7 +148,7 @@ export default function TaskCard({ obligation, onComplete }: TaskCardProps) {
                   "
                 >
                   <ExternalLink className="w-4 h-4" />
-                  Open
+                  {BUTTON_LABELS.open}
                 </button>
               )}
 

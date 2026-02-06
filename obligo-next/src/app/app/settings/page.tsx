@@ -2,18 +2,25 @@
 
 import Link from "next/link";
 import { Card, PageTitle, SectionTitle } from "@/components/ui/Page";
+import { DOCTRINE, NAV_LABELS } from "@/lib/copy";
 
 export default function SettingsPage() {
   return (
     <div className="space-y-6">
       <div className="space-y-2">
         <SectionTitle>Preferences</SectionTitle>
-        <PageTitle>Settings</PageTitle>
+        <PageTitle>{NAV_LABELS.settings}</PageTitle>
       </div>
       <Card>
         <p className="text-sm text-gray-600">
           Account, notifications, and integrations will live here.
         </p>
+      </Card>
+      <Card>
+        <div className="space-y-2">
+          <h3 className="text-sm font-semibold text-gray-900">About</h3>
+          <p className="text-sm text-gray-600">{DOCTRINE}</p>
+        </div>
       </Card>
       <Card>
         <div className="space-y-2">

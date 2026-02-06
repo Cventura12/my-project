@@ -6,6 +6,7 @@ import ApprovalsQueue from "@/components/v2/approvals/ApprovalsQueue";
 import EmailDraftModal from "@/components/financial-aid/EmailDraftModal";
 import { listDrafts, improveDraft, sendDraft, cancelDraft } from "@/api/approvals";
 import { useAuth } from "@/lib/supabase/auth-provider";
+import { NAV_LABELS, EMPTY_STATES } from "@/lib/copy";
 
 export default function ApprovalsPage() {
   const { user } = useAuth();
@@ -96,7 +97,7 @@ export default function ApprovalsPage() {
   return (
     <div className="space-y-6">
       <div className="space-y-1">
-        <PageTitle>Approvals</PageTitle>
+        <PageTitle>{NAV_LABELS.approvals}</PageTitle>
         <MetaText>Review and approve outbound follow-ups before they’re sent.</MetaText>
       </div>
 
@@ -110,10 +111,7 @@ export default function ApprovalsPage() {
         <ErrorState message={error} onRetry={() => load(user.id)} />
       ) : pending.length === 0 ? (
         <div className="bg-gray-50 border border-dashed border-gray-200 rounded-xl p-6 text-center">
-          <h3 className="text-sm font-semibold text-gray-800">Nothing to approve</h3>
-          <p className="text-xs text-gray-500 mt-1">
-            You’re all caught up. Obligo will queue follow-ups when confirmation is missing.
-          </p>
+          <p className="text-sm text-gray-600 whitespace-pre-line">{EMPTY_STATES.approvals}</p>
         </div>
       ) : (
         <ApprovalsQueue drafts={pending} onOpen={(draft) => setSelected(draft)} />

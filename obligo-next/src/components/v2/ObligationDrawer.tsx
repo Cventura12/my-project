@@ -1,25 +1,50 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Drawer from "@/components/Drawer";
 import { ErrorState, Skeleton } from "@/components/ui/Page";
-import { getDependencies, getObligations, getProofMissing, getSteps, getStuckDetection } from "@/api/obligations";
+import {
+  getDependencies,
+  getObligations,
+  getProofMissing,
+  getSteps,
+  getStuckDetection,
+} from "@/api/obligations";
 import { listDrafts, improveDraft, sendDraft, cancelDraft } from "@/api/approvals";
 import { toUIObligationSummary } from "@/adapters/obligationAdapter";
 import { UIObligationDetail } from "@/types/ui";
 import { createSupabaseBrowser } from "@/lib/supabase/client";
 import EmailDraftModal from "@/components/financial-aid/EmailDraftModal";
+import { BUTTON_LABELS, STATUS_LABELS } from "@/lib/copy";
 
 type DrawerState =
   | { status: "idle" }
   | { status: "loading" }
   | { status: "error"; message: string }
-  | { status: "ready"; detail: UIObligationDetail; proofs: any[]; drafts: any[]; blockers: any[]; stuckInfo?: any };
+  | {
+      status: "ready";
+      detail: UIObligationDetail & {
+        created_at?: string | null;
+        submitted_at?: string | null;
+        verified_at?: string | null;
+        failed_at?: string | null;
+        status_changed_at?: string | null;
+        severity_since?: string | null;
+      };
+      proofs: any[];
+      drafts: any[];
+      blockers: any[];
+      stuckInfo?: any;
+    };
 
 function formatDate(dt?: string | null) {
-  if (!dt) return "—";
+  if (!dt) return "-";
   try {
-    return new Date(dt).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" });
+    return new Date(dt).toLocaleDateString("en-US", {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+    });
   } catch {
     return dt;
   }
@@ -44,6 +69,7 @@ export default function ObligationDrawer({
 }) {
   const [state, setState] = useState<DrawerState>({ status: "idle" });
   const [selectedDraft, setSelectedDraft] = useState<any | null>(null);
+  const verificationRef = useRef<HTMLDivElement | null>(null);
 
   const load = async () => {
     if (!userId || !obligationId) {
@@ -53,7 +79,7 @@ export default function ObligationDrawer({
 
     try {
       setState({ status: "loading" });
-      const [obls, deps, stuck, proofsMissing, steps, drafts] = await Promise.all([
+      const [obls, , stuck, , steps, drafts] = await Promise.all([
         getObligations(userId),
         getDependencies(userId),
         getStuckDetection(userId),
@@ -81,7 +107,14 @@ export default function ObligationDrawer({
         .eq("obligation_id", obligationId);
       const proofs = proofRes.data || [];
 
-      const detail: UIObligationDetail = {
+      const detail: UIObligationDetail & {
+        created_at?: string | null;
+        submitted_at?: string | null;
+        verified_at?: string | null;
+        failed_at?: string | null;
+        status_changed_at?: string | null;
+        severity_since?: string | null;
+      } = {
         ...summary,
         source: obligation.source,
         sourceRef: obligation.source_ref,
@@ -91,6 +124,12 @@ export default function ObligationDrawer({
         stuck: !!(stuckInfo?.stuck ?? summary.stuck),
         reasonLine: summary.reasonLine,
         proofCount: proofs.length,
+        created_at: obligation.created_at,
+        submitted_at: obligation.submitted_at,
+        verified_at: obligation.verified_at,
+        failed_at: obligation.failed_at,
+        status_changed_at: obligation.status_changed_at,
+        severity_since: obligation.severity_since,
       };
 
       const draftList = (drafts.drafts ?? []).filter((d: any) => d.obligation_id === obligationId);
@@ -128,11 +167,11 @@ export default function ObligationDrawer({
   const content = useMemo(() => {
     if (state.status === "loading") {
       return (
-        <div className="space-y-3">
-          <Skeleton className="h-5 w-2/3" />
-          <Skeleton className="h-3 w-1/2" />
-          <Skeleton className="h-24 w-full" />
-          <Skeleton className="h-24 w-full" />
+        <div className="space-y-4">
+          <Skeleton className="h-6 w-2/3" />
+          <Skeleton className="h-4 w-1/2" />
+          <Skeleton className="h-28 w-full" />
+          <Skeleton className="h-28 w-full" />
         </div>
       );
     }
@@ -140,14 +179,49 @@ export default function ObligationDrawer({
       return <ErrorState message={state.message} onRetry={load} />;
     }
     if (state.status !== "ready") {
-      return <p className="text-sm text-gray-500">Select an obligation.</p>;
+      return <p className="text-sm text-muted-foreground">Select an obligation.</p>;
     }
 
     const { detail, proofs, drafts, blockers, stuckInfo } = state;
     const dueIn = daysUntil(detail.deadline ? detail.deadline.toISOString() : null);
     const dueLine = detail.deadline
       ? `Due ${detail.deadline.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`
-      : "No deadline";
+      : "No deadline recorded";
+
+    const statusLabel = () => {
+      if (detail.proofRequired && detail.proofCount === 0) return STATUS_LABELS.proofMissing;
+      if (detail.status === "pending") return STATUS_LABELS.pending;
+      if (detail.status === "submitted") return STATUS_LABELS.submitted;
+      if (detail.status === "verified") return STATUS_LABELS.verified;
+      if (detail.status === "failed") return STATUS_LABELS.failed;
+      if (detail.status === "blocked" || detail.isBlocked) return STATUS_LABELS.blocked;
+      return detail.status?.toUpperCase() || STATUS_LABELS.pending;
+    };
+
+    const statusMeaning = () => {
+      if (detail.status === "submitted") {
+        return "This obligation is not considered complete until verification is attached.";
+      }
+      if (detail.status === "blocked" || detail.isBlocked) {
+        return "This obligation cannot proceed until blocking dependencies are verified.";
+      }
+      if (detail.status === "verified") {
+        return "Verified. This obligation is complete unless the institution changes requirements.";
+      }
+      if (detail.status === "failed") {
+        return "Requirement failed. This state is irreversible.";
+      }
+      if (detail.proofRequired && detail.proofCount === 0) {
+        return "Verification missing. This obligation cannot be verified.";
+      }
+      return "Unresolved. Verification is required to complete this obligation.";
+    };
+
+    const verificationActionLabel = detail.proofRequired
+      ? detail.proofCount === 0
+        ? BUTTON_LABELS.uploadProof
+        : BUTTON_LABELS.reviewVerification
+      : BUTTON_LABELS.reviewObligation;
 
     const addProof = async () => {
       if (!detail.id || !userId) return;
@@ -162,121 +236,178 @@ export default function ObligationDrawer({
       });
     };
 
+    const handleVerificationAction = () => {
+      if (detail.proofRequired && detail.proofCount === 0) {
+        addProof();
+        return;
+      }
+      verificationRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    };
+
+    const history: Array<{ label: string; date: string | null | undefined }> = [];
+    history.push({ label: "Created", date: detail.created_at });
+    if (detail.status_changed_at) history.push({ label: "Status changed", date: detail.status_changed_at });
+    if (detail.submitted_at) history.push({ label: STATUS_LABELS.submitted, date: detail.submitted_at });
+    if (detail.verified_at) history.push({ label: STATUS_LABELS.verified, date: detail.verified_at });
+    if (detail.failed_at) history.push({ label: STATUS_LABELS.failed, date: detail.failed_at });
+    if (detail.severity_since) history.push({ label: "Severity escalated", date: detail.severity_since });
+
+    const blocks = (detail as any).blocks || [];
+
     return (
-      <div className="space-y-6">
-        {/* Header */}
-        <div className="space-y-2">
-          <div className="flex items-start justify-between">
-            <div>
-              <h2 className="text-lg font-bold text-black">{detail.title}</h2>
-              <p className="text-xs text-gray-400">{detail.schoolName} · {detail.type}</p>
-            </div>
-            <div className="text-xs text-gray-500 text-right">
-              {dueLine}
-              {dueIn !== null && (
-                <div className="text-[10px] text-gray-400">Due in {dueIn} days</div>
-              )}
-            </div>
+      <div className="space-y-8 text-sm text-foreground">
+        {/* A) Header */}
+        <section className="space-y-2 border-b border-border/60 pb-5">
+          <div className="space-y-1">
+            <h2 className="text-lg font-semibold text-foreground">{detail.title}</h2>
+            <div className="text-sm text-muted-foreground">{detail.type}</div>
           </div>
-          <div className="flex flex-wrap gap-2 text-[10px]">
-            <span className="px-2 py-0.5 rounded-full border bg-gray-100 text-gray-700 border-gray-200">
-              {detail.status.toUpperCase()}
-            </span>
-            <span className="px-2 py-0.5 rounded-full border bg-gray-100 text-gray-700 border-gray-200">
-              {detail.severity.toUpperCase()}
-            </span>
+          <div className="text-xs text-muted-foreground">
+            Source: {detail.source || "unknown"}
+            {detail.sourceRef ? ` - Ref: ${detail.sourceRef}` : ""}
           </div>
-        </div>
+          <div className="text-xs text-muted-foreground">Created {formatDate(detail.created_at)}</div>
+        </section>
 
-        {/* What's true */}
-        <div className="bg-gray-50 border border-gray-200 rounded-lg p-3">
-          <p className="text-[10px] text-gray-400 uppercase">What&apos;s true</p>
-          <p className="text-xs text-gray-600 mt-1">Source: {detail.source || "unknown"}</p>
-          {detail.sourceRef && (
-            <p className="text-xs text-gray-600">Ref: {detail.sourceRef}</p>
+        {/* B) Status */}
+        <section className="space-y-3 border-b border-border/60 pb-5">
+          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Status</div>
+          <div className="text-2xl font-semibold text-foreground">{statusLabel()}</div>
+          <p className="text-sm text-muted-foreground">{statusMeaning()}</p>
+          <div className="flex flex-wrap gap-3 text-xs text-muted-foreground">
+            <span>Severity: {detail.severity.toUpperCase()}</span>
+            <span>{dueLine}{dueIn !== null ? ` - Due in ${dueIn} days` : ""}</span>
+          </div>
+        </section>
+
+        {/* C) Verification */}
+        <section ref={verificationRef} className="space-y-3 border-b border-border/60 pb-5">
+          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Verification</div>
+          <div className="text-sm text-foreground">
+            Required: <span className="font-semibold">{detail.proofRequired ? "Yes" : "No"}</span>
+          </div>
+          <div className="text-sm text-foreground">
+            Attached proofs: <span className="font-semibold">{proofs.length}</span>
+          </div>
+          {detail.proofRequired && proofs.length === 0 && (
+            <div className="text-sm text-foreground">{STATUS_LABELS.proofMissing}</div>
           )}
-          <p className="text-xs text-gray-500 mt-2">{detail.reasonLine}</p>
-        </div>
-
-        {/* Status timeline */}
-        <div className="space-y-2">
-          <p className="text-[10px] text-gray-400 uppercase">Timeline</p>
-          <div className="text-xs text-gray-600 space-y-1">
-            <div>Created: {formatDate((detail as any).created_at)}</div>
-            {(detail as any).submitted_at && <div>Submitted: {formatDate((detail as any).submitted_at)}</div>}
-            {(detail as any).verified_at && <div>Verified: {formatDate((detail as any).verified_at)}</div>}
-            {(detail as any).failed_at && <div>Failed: {formatDate((detail as any).failed_at)}</div>}
-          </div>
-        </div>
-
-        {/* Proof section */}
-        <div className="space-y-2">
-          <p className="text-[10px] text-gray-400 uppercase">Proof</p>
-          <div className="text-xs text-gray-600">
-            Required: {detail.proofRequired ? "Yes" : "No"}
-          </div>
-          <div className="text-xs text-gray-500">Count: {proofs.length}</div>
-          {proofs.length > 0 && (
-            <ul className="text-xs text-gray-600 space-y-1">
+          {proofs.length > 0 ? (
+            <ul className="space-y-1 text-xs text-muted-foreground">
               {proofs.map((p: any) => (
-                <li key={p.id}>• {p.type} — {p.source_ref}</li>
+                <li key={p.id}>- {p.type} - {p.source_ref}</li>
               ))}
             </ul>
+          ) : (
+            <div className="text-xs text-muted-foreground">No proofs attached.</div>
           )}
           <button
-            onClick={addProof}
-            className="px-3 py-2 text-xs font-semibold rounded-lg border border-gray-200"
+            onClick={handleVerificationAction}
+            className="w-full px-4 py-2 text-sm font-semibold rounded-lg border border-border/60 hover:bg-muted/40"
           >
-            Add proof
+            {verificationActionLabel}
           </button>
-        </div>
+        </section>
 
-        {/* Blockers */}
-        <div className="space-y-2">
-          <p className="text-[10px] text-gray-400 uppercase">Blockers / Dependencies</p>
-          {blockers.length === 0 ? (
-            <p className="text-xs text-gray-500">No blockers</p>
-          ) : (
-            <ul className="text-xs text-gray-600 space-y-1">
-              {blockers.map((b: any) => (
-                <li key={`${b.obligation_id}-${b.status}`}>• {b.type} — {b.title} ({b.status})</li>
-              ))}
-            </ul>
+        {/* D) Dependencies */}
+        <section className="space-y-3 border-b border-border/60 pb-5">
+          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Dependencies</div>
+          <div className="space-y-2">
+            <div className="text-xs font-semibold text-muted-foreground">Blocked by</div>
+            {blockers.length === 0 ? (
+              <div className="text-xs text-muted-foreground">No dependencies recorded.</div>
+            ) : (
+              <ul className="space-y-1 text-xs text-muted-foreground">
+                {blockers.map((b: any) => (
+                  <li key={`${b.obligation_id}-${b.status}`}>- {b.type} - {b.title} ({b.status})</li>
+                ))}
+              </ul>
+            )}
+          </div>
+          <div className="space-y-2">
+            <div className="text-xs font-semibold text-muted-foreground">Blocks</div>
+            {blocks.length === 0 ? (
+              <div className="text-xs text-muted-foreground">No dependencies recorded.</div>
+            ) : (
+              <ul className="space-y-1 text-xs text-muted-foreground">
+                {blocks.map((b: any) => (
+                  <li key={`${b.obligation_id || b.id}-${b.status || ""}`}>
+                    - {b.type} - {b.title} ({b.status})
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+          {detail.overrides && detail.overrides.length > 0 && (
+            <div className="space-y-2">
+              <div className="text-xs font-semibold text-muted-foreground">Overrides</div>
+              <ul className="space-y-1 text-xs text-muted-foreground">
+                {detail.overrides.map((o: any) => (
+                  <li key={`${o.title}-${o.status}-${o.created_at || ""}`}>
+                    - {o.type} - {o.title} ({o.status}) {o.created_at ? ` - ${formatDate(o.created_at)}` : ""}
+                  </li>
+                ))}
+              </ul>
+            </div>
           )}
           {stuckInfo?.stuck_reason && (
-            <p className="text-xs text-gray-500">Stuck reason: {stuckInfo.stuck_reason}</p>
+            <div className="text-xs text-muted-foreground">Stuck reason: {stuckInfo.stuck_reason}</div>
           )}
-        </div>
+        </section>
 
-        {/* Follow-ups */}
-        <div className="space-y-2">
-          <p className="text-[10px] text-gray-400 uppercase">Follow-ups</p>
-          {drafts.length === 0 ? (
-            <p className="text-xs text-gray-500">No drafts yet.</p>
+        {/* E) History */}
+        <section className="space-y-3 border-b border-border/60 pb-5">
+          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">History (Immutable)</div>
+          {history.filter((h) => h.date).length === 0 ? (
+            <div className="text-xs text-muted-foreground">No history recorded.</div>
           ) : (
-            <div className="space-y-2">
+            <ul className="space-y-2 text-xs text-muted-foreground">
+              {history
+                .filter((h) => h.date)
+                .map((h) => (
+                  <li key={`${h.label}-${h.date}`}>- {h.label} - {formatDate(h.date)}</li>
+                ))}
+            </ul>
+          )}
+        </section>
+
+        {/* F) Actions */}
+        <section className="space-y-3">
+          <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Actions</div>
+          {drafts.length === 0 ? (
+            <div className="text-xs text-muted-foreground">No follow-up drafts.</div>
+          ) : (
+            <div className="space-y-3">
               {drafts.map((d: any) => (
-                <div key={d.id} className="border border-gray-200 rounded-lg p-3">
-                  <p className="text-xs font-semibold text-gray-800">{d.subject || "Draft"}</p>
-                  <p className="text-[10px] text-gray-400">Status: {d.status}</p>
+                <div key={d.id} className="border border-border/60 rounded-lg p-3">
+                  <p className="text-xs font-semibold text-foreground">{d.subject || "Draft"}</p>
+                  <p className="text-[10px] text-muted-foreground">Status: {d.status}</p>
                   {d.status === "pending_approval" && (
-                    <div className="mt-2 flex gap-2">
+                    <div className="mt-2 flex flex-wrap gap-2">
                       <button
                         onClick={() => setSelectedDraft(d)}
-                        className="px-2 py-1 text-[10px] font-semibold border border-gray-200 rounded"
+                        className="px-3 py-2 text-xs font-semibold rounded-lg border border-border/60 hover:bg-muted/40"
                       >
                         Edit
                       </button>
                       <button
-                        onClick={() => sendDraft({
-                          user_id: userId!,
-                          follow_up_id: d.id,
-                          edited_content: d.edited_content || null,
-                          edited_subject: d.subject || null,
-                        })}
-                        className="px-2 py-1 text-[10px] font-semibold border border-gray-200 rounded"
+                        onClick={() =>
+                          sendDraft({
+                            user_id: userId!,
+                            follow_up_id: d.id,
+                            edited_content: d.edited_content || null,
+                            edited_subject: d.subject || null,
+                          })
+                        }
+                        className="px-3 py-2 text-xs font-semibold rounded-lg border border-border/60 hover:bg-muted/40"
                       >
                         Approve & Send
+                      </button>
+                      <button
+                        onClick={() => cancelDraft({ user_id: userId!, follow_up_id: d.id })}
+                        className="px-3 py-2 text-xs font-semibold rounded-lg border border-border/60 hover:bg-muted/40"
+                      >
+                        Cancel
                       </button>
                     </div>
                   )}
@@ -284,7 +415,7 @@ export default function ObligationDrawer({
               ))}
             </div>
           )}
-        </div>
+        </section>
 
         {selectedDraft && (
           <EmailDraftModal
@@ -296,11 +427,20 @@ export default function ObligationDrawer({
               )
             }
             onSend={(id, editedContent, editedSubject) =>
-              sendDraft({ user_id: userId!, follow_up_id: id, edited_content: editedContent, edited_subject: editedSubject })
+              sendDraft({
+                user_id: userId!,
+                follow_up_id: id,
+                edited_content: editedContent,
+                edited_subject: editedSubject,
+              })
                 .then(() => true)
                 .catch(() => false)
             }
-            onCancel={(id) => cancelDraft({ user_id: userId!, follow_up_id: id }).then(() => true).catch(() => false)}
+            onCancel={(id) =>
+              cancelDraft({ user_id: userId!, follow_up_id: id })
+                .then(() => true)
+                .catch(() => false)
+            }
           />
         )}
       </div>

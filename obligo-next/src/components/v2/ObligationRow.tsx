@@ -2,6 +2,7 @@
 
 import { UIObligationSummary } from "@/types/ui";
 import { useSelection } from "./selection";
+import { STATUS_LABELS } from "@/lib/copy";
 
 function formatDeadline(deadline: Date | null) {
   if (!deadline) return { primary: "No deadline", secondary: "" };
@@ -14,8 +15,13 @@ function formatDeadline(deadline: Date | null) {
 }
 
 function primaryTruth(item: UIObligationSummary) {
-  if (item.proofRequired && item.proofCount === 0) return "Proof missing";
-  if (item.isBlocked) return "Blocked";
+  if (item.proofRequired && item.proofCount === 0) return STATUS_LABELS.proofMissing;
+  if (item.isBlocked) return STATUS_LABELS.blocked;
+  if (item.status === "pending") return STATUS_LABELS.pending;
+  if (item.status === "submitted") return STATUS_LABELS.submitted;
+  if (item.status === "verified") return STATUS_LABELS.verified;
+  if (item.status === "failed") return STATUS_LABELS.failed;
+  if (item.status === "blocked") return STATUS_LABELS.blocked;
   if (item.status) return item.status.replaceAll("_", " ");
   return "Needs attention";
 }

@@ -5,6 +5,7 @@ import { UIObligationSummary } from "@/types/ui";
 import ObligationRow from "./ObligationRow";
 import SectionHeader from "./SectionHeader";
 import { ChevronDown } from "lucide-react";
+import { EMPTY_STATES, STATUS_LABELS } from "@/lib/copy";
 
 export default function ObligationSection({
   title,
@@ -43,7 +44,7 @@ export default function ObligationSection({
         <div className="space-y-3">
           {items.length === 0 ? (
             <div className="rounded-xl border border-dashed border-border/70 bg-muted/20 px-4 py-6 text-center text-sm text-muted-foreground">
-              {title === "Blocked" ? "No blocked items." : "Nothing here yet."}
+              {title === STATUS_LABELS.blocked ? EMPTY_STATES.blocked : "Nothing here yet."}
             </div>
           ) : (
             <div className="rounded-xl border border-border/60 bg-background divide-y">

@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { EmptyState, ErrorState, MetaText, PageTitle, Skeleton } from "@/components/ui/Page";
+import { NAV_LABELS, EMPTY_STATES, BUTTON_LABELS } from "@/lib/copy";
 import SignalsList from "@/components/v2/inbox/SignalsList";
 import SignalDrawer from "@/components/v2/inbox/SignalDrawer";
 import { getEmailConnection, listSignals, scanEmail, dismissEmail } from "@/api/inbox";
@@ -104,7 +105,7 @@ export default function InboxV2Page() {
     <div className="space-y-6">
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div className="space-y-1">
-          <PageTitle>Inbox</PageTitle>
+          <PageTitle>{NAV_LABELS.inbox}</PageTitle>
           <MetaText>Signals that may require an obligation, proof, or follow-up.</MetaText>
         </div>
         <div className="flex items-center gap-2">
@@ -179,7 +180,7 @@ export default function InboxV2Page() {
       ) : signals.length === 0 ? (
         <EmptyState>
           <Inbox className="w-8 h-8 text-gray-300 mx-auto mb-3" />
-          <p className="text-sm text-gray-600">No actionable signals yet.</p>
+          <p className="text-sm text-gray-600 whitespace-pre-line">{EMPTY_STATES.inbox}</p>
           <button
             onClick={handleScan}
             className="inline-block mt-3 px-4 py-2 text-sm font-semibold rounded-lg bg-black text-white hover:bg-gray-800"

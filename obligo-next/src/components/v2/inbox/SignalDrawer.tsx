@@ -2,6 +2,7 @@
 
 import Drawer from "@/components/Drawer";
 import { UISignal } from "@/types/ui";
+import { BUTTON_LABELS } from "@/lib/copy";
 
 export default function SignalDrawer({
   signal,
@@ -57,7 +58,7 @@ export default function SignalDrawer({
             onClick={() => onDismiss(signal.id)}
             className="px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:text-black hover:border-black"
           >
-            Dismiss
+            {BUTTON_LABELS.dismiss}
           </button>
           {canAttachProof && (
             <button
@@ -67,7 +68,7 @@ export default function SignalDrawer({
               }}
               className="px-3 py-1.5 rounded-lg border border-gray-200 text-gray-600 hover:text-black hover:border-black"
             >
-              Attach as proof
+              {BUTTON_LABELS.uploadProof}
             </button>
           )}
         </div>
