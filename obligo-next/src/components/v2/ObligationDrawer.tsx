@@ -93,7 +93,7 @@ export default function ObligationDrawer({
         proofCount: proofs.length,
       };
 
-      const draftList = (drafts.drafts || drafts.data || drafts || []).filter((d: any) => d.obligation_id === obligationId);
+      const draftList = (drafts.drafts ?? []).filter((d: any) => d.obligation_id === obligationId);
 
       setState({
         status: "ready",
