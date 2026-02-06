@@ -61,11 +61,11 @@ def _build_obligation_title(subject: str, analysis: Dict[str, Any]) -> str:
 
 
 def _get_supabase() -> SupabaseClient:
-    """Create Supabase admin client using service role or anon key."""
+    """Create Supabase admin client using service role key."""
     url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL", "")
-    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("NEXT_PUBLIC_SUPABASE_ANON_KEY", "")
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
     if not url or not key:
-        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY (or NEXT_PUBLIC_ variants) must be set")
+        raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set")
     return create_client(url, key)
 
 

@@ -1047,22 +1047,39 @@ async def gmail_oauth_callback(code: str = None, error: str = None, state: Optio
                 raise HTTPException(status_code=400, detail="Missing user_id in OAuth state")
 
             sb = _get_supabase()
-            existing = sb.table("email_connections").select("*").eq("user_id", user_id).single().execute()
-            existing_data = existing.data or {}
+            existing_data = {}
+            try:
+                existing = sb.table("email_connections").select("*").eq("user_id", user_id).maybe_single().execute()
+                if existing and getattr(existing, "data", None):
+                    existing_data = existing.data or {}
+            except Exception as e:
+                logger.warning("Email connection lookup failed (continuing): %s", e)
 
-            sb.table("email_connections").upsert(
-                {
-                    "user_id": user_id,
-                    "provider": "gmail",
-                    "access_token": tokens["access_token"],
-                    # Google may not return refresh_token on subsequent consents.
-                    "refresh_token": tokens.get("refresh_token") or existing_data.get("refresh_token"),
-                    "token_expiry": tokens.get("expires_at"),
-                    "email_address": tokens.get("email") or existing_data.get("email_address"),
-                    "is_active": True,
-                },
+            upsert_payload = {
+                "user_id": user_id,
+                "provider": "gmail",
+                "access_token": tokens["access_token"],
+                # Google may not return refresh_token on subsequent consents.
+                "refresh_token": tokens.get("refresh_token") or existing_data.get("refresh_token"),
+                "token_expiry": tokens.get("expires_at"),
+                "email_address": tokens.get("email") or existing_data.get("email_address"),
+                "is_active": True,
+            }
+
+            upsert_res = sb.table("email_connections").upsert(
+                upsert_payload,
                 on_conflict="user_id",
             ).execute()
+            if getattr(upsert_res, "error", None):
+                logger.error(
+                    "Email connection upsert failed: status=%s error=%s",
+                    getattr(upsert_res, "status_code", None),
+                    upsert_res.error,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to store email connection: {upsert_res.error}",
+                )
         else:
             # Legacy single-user local dev (writes token.json)
             save_gmail_credentials(
