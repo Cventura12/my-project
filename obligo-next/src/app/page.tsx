@@ -41,6 +41,9 @@ export default function LandingPage() {
           <Link href="/app/schools" className="hover:text-foreground transition-colors">
             Schools
           </Link>
+          <Link href="/app/settings" className="hover:text-foreground transition-colors">
+            Settings
+          </Link>
         </div>
         <div className="flex items-center gap-2">
           <button
